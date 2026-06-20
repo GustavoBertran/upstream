@@ -1,0 +1,46 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.eggs/
+*.egg
+
+# Virtual environments
+.venv/
+env/
+venv/
+
+# Pytest
+.pytest_cache/
+.coverage
+
+# Editors
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# macOS
+.DS_Store
+
+# Large bioinformatics files (do not commit)
+*.bam
+*.bai
+*.fastq.gz
+*.fq.gz
+*.sam
+*.vcf
+*.bed
+*.narrowPeak
+*.broadPeak
+*.bigWig
+*.bw
+
+# Reference indices (large, built on server)
+indices/
+
+# Pipeline output (results are user-local)
+results/
+output/
