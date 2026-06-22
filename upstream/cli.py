@@ -28,7 +28,7 @@ from rich.console import Console
 from rich.markdown import Markdown
 from rich.panel import Panel
 
-from . import __version__, checkpoints, diagnostics, downloader, obama, preflight, runner
+from . import __version__, checkpoints, diagnostics, downloader, indexhelp, obama, preflight, runner
 from .samplesheet import scan_fastq_dir
 
 app = typer.Typer(
@@ -190,6 +190,15 @@ def _die(msg: str) -> None:
 def _require_dir(path: Path, label: str) -> None:
     if not path.exists():
         _die(f"{label} not found: {path}")
+
+
+def _require_index(path: Optional[Path], tool: str, label: str) -> None:
+    """Like _require_dir, but a missing index points the user at `index-help`."""
+    if path is None or not Path(path).exists():
+        console.print(f"[bold red]Error:[/bold red] {label} not found: {path}")
+        console.print(f"[dim]Don't have this index yet? See how to build it:[/dim] "
+                      f"[bold]upstream index-help --tool {tool} --genome <human|mouse>[/bold]")
+        raise typer.Exit(1)
 
 
 def _check(ok: bool, msg: str) -> None:
@@ -388,9 +397,9 @@ def rnaseq(
     sample_list = _read_samplesheet(samples)
     _require_tools("rnaseq", dry=dry_run, aligner=aligner, output_format=output_format)
     if aligner == "salmon":
-        _require_dir(salmon_index, "Salmon index")
+        _require_index(salmon_index, "salmon", "Salmon index")
     else:
-        _require_dir(star_index, "STAR index")
+        _require_index(star_index, "star", "STAR index")
     runner.DRY_RUN = dry_run
     outdir.mkdir(parents=True, exist_ok=True)
 
@@ -922,7 +931,7 @@ def methylation(
         _die("--bismark-genome is required for --method wgbs.")
     sample_list = _read_samplesheet(samples)
     _require_tools("methylation", dry=dry_run, method="wgbs")
-    _require_dir(bismark_genome, "Bismark genome directory")
+    _require_index(bismark_genome, "bismark", "Bismark genome directory")
 
     TOTAL = 4
     console.print(f"\n[bold]Methylation pipeline[/bold] — {len(sample_list)} sample(s) → {outdir}\n")
@@ -1078,6 +1087,31 @@ def samplesheet(
     )
     console.print("[dim]Next: fill in the 'group' column (disease/control), then run a track "
                   "(or 'upstream check').[/dim]")
+
+
+# ── Index help ───────────────────────────────────────────────────────────────
+
+
+@app.command(name="index-help")
+def index_help(
+    tool: Annotated[str, typer.Option("--tool", help="salmon | star | bowtie2 | bismark")],
+    genome: Annotated[str, typer.Option("--genome", help="human | mouse")] = "human",
+) -> None:
+    """Print recommended commands to obtain/build a reference index.
+
+    This only prints guidance — it does not download or build anything (index builds
+    are large and machine-specific). Copy the commands and run them where you have
+    the RAM/disk (STAR needs ~30 GB RAM, Bismark ~100 GB disk for human).
+    """
+    if tool not in indexhelp.TOOLS:
+        _die(f"--tool must be one of: {', '.join(indexhelp.TOOLS)}")
+    if genome not in indexhelp.GENOMES:
+        _die(f"--genome must be one of: {', '.join(indexhelp.GENOMES)}")
+    snippet = indexhelp.recommend(tool, genome)
+    console.print(Panel(Markdown("```bash\n" + snippet + "\n```"),
+                        title=f"[bold]Build a {tool} index — {indexhelp.GENOMES[genome]['label']}[/bold]",
+                        border_style="cyan", padding=(1, 2)))
+    console.print("[dim]GENCODE release shown is a sensible default — bump it for a newer one.[/dim]")
 
 
 # ── Bug report ───────────────────────────────────────────────────────────────

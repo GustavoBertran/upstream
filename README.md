@@ -232,6 +232,11 @@ results/
 
 ## Reference Indices
 
+Don't have an index yet? Run **`upstream index-help --tool <salmon|star|bowtie2|bismark> --genome <human|mouse>`**
+to print the exact commands to download the reference (GENCODE) and build it. (It only
+prints guidance — STAR needs ~30 GB RAM and Bismark ~100 GB disk to build, so run those on
+a server.) A missing index at run time points you to this command automatically.
+
 Indices must be built once before running the pipeline. See `scripts/prepare_sample_data.sh`
 for the exact commands. Typical locations on a shared server:
 
