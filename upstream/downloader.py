@@ -66,6 +66,14 @@ CATALOG: dict[str, dict] = {
             {"name": "control", "group": "control", "srr": None},
         ],
     },
+    "chipseq": {
+        "label": "ChIP-seq — breast cancer",
+        "geo": None,
+        "samples": [
+            {"name": "disease", "group": "disease", "srr": None},
+            {"name": "control", "group": "control", "srr": None},
+        ],
+    },
     "methylation": {
         "label": "Methylation (WGBS/RRBS) — breast cancer",
         "geo": None,

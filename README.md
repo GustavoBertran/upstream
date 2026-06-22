@@ -128,6 +128,38 @@ samples and counts reads per peak (deeptools `multiBamSummary`), writing a
 differential accessibility — instead of the default MACS2-score OBAMA matrix
 (the score isn't a count). See `content/atacseq_export_formats.md`.
 
+**ChIP-seq:**
+```bash
+upstream chipseq \
+  --samples samples.csv \
+  --bowtie2-index /path/to/bowtie2/hg38 \
+  --peak-type narrow \
+  --outdir results/chipseq/
+```
+
+ChIP-seq mirrors ATAC-seq but with two ChIP essentials:
+
+- **Input control** — the samplesheet may add an optional `control` column naming
+  each ChIP sample's input (by `name`); rows with `group=input` are aligned to
+  provide the MACS2 `-c` background but are not peak-called or placed in the matrix.
+  Input is optional (MACS2 runs without it).
+- **`--peak-type`** — `narrow` (default; TFs, H3K4me3, H3K27ac) or `broad`
+  (H3K27me3, H3K9me3, H3K36me3 → MACS2 `--broad`).
+
+Default output is the **DESeq2/edgeR** consensus-peak count matrix (the validated
+downstream for peak data). `--format obama` is available but **experimental** for
+ChIP: OBAMA's gene-based interpretation (GO/Enrichr/STRING) needs peaks annotated
+to genes first. See `content/chipseq_export_formats.md`.
+
+Example ChIP samplesheet:
+```csv
+name,group,r1,r2,control
+H3K27ac_tumor,disease,t_R1.fq.gz,t_R2.fq.gz,input_tumor
+H3K27ac_normal,control,n_R1.fq.gz,n_R2.fq.gz,input_normal
+input_tumor,input,it_R1.fq.gz,it_R2.fq.gz,
+input_normal,input,in_R1.fq.gz,in_R2.fq.gz,
+```
+
 **DNA Methylation — WGBS (Bismark pipeline):**
 ```bash
 upstream methylation \

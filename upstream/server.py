@@ -54,6 +54,8 @@ class RunRequest(BaseModel):
     output_format: Optional[str] = None   # obama | matrix | both
     gtf: Optional[str] = None
     tx2gene: Optional[str] = None
+    # chipseq
+    peak_type: Optional[str] = None       # narrow | broad
     # legacy catalog download
     data_track: Optional[str] = None
     # geo download
@@ -162,13 +164,15 @@ def _build_cmd(req: RunRequest) -> list[str]:
         cmd += ["--bowtie2-index", req.bowtie2_index]
     if req.bismark_genome:
         cmd += ["--bismark-genome", req.bismark_genome]
-    if req.output_format and req.track in ("rnaseq", "methylation", "atacseq"):
+    if req.output_format and req.track in ("rnaseq", "methylation", "atacseq", "chipseq"):
         cmd += ["--format", req.output_format]
     if req.track == "rnaseq":
         if req.gtf:
             cmd += ["--gtf", req.gtf]
         if req.tx2gene:
             cmd += ["--tx2gene", req.tx2gene]
+    if req.track == "chipseq" and req.peak_type:
+        cmd += ["--peak-type", req.peak_type]
     return cmd
 
 
@@ -849,6 +853,7 @@ input:checked+.slider::before{transform:translateX(14px)}
 const TRACKS = {
   rnaseq:      {label:"RNA-seq",      desc:"fastp → STAR or Salmon → counts matrix (OBAMA / DESeq2)", nsteps:3, isRnaseq:true},
   atacseq:     {label:"ATAC-seq",     desc:"fastp → Bowtie2 → filter → MACS2 → matrix (OBAMA / DESeq2)", nsteps:5, extra:["bowtie2-index"]},
+  chipseq:     {label:"ChIP-seq",     desc:"fastp → Bowtie2 → filter → MACS2 (±input) → counts (DESeq2/edgeR)", nsteps:5, extra:["bowtie2-index"]},
   methylation: {label:"Methylation",  desc:"WGBS (Bismark) or 450K/EPIC array (GEO beta matrix)",nsteps:4, isMethylation:true},
   qc:          {label:"QC",           desc:"FastQC + MultiQC",                                    nsteps:2, extra:[]},
   download:    {label:"Download Data",desc:"Browse GEO, pick conditions, fasterq-dump",          isDownload:true},
@@ -952,6 +957,26 @@ function selectTrack(id) {
               '<option value="both">Both</option>' +
             '</select>' +
           '</div>';
+      }
+      if (id === "chipseq") {
+        ef.innerHTML +=
+          '<div class="field full">' +
+            '<label>Peak type</label>' +
+            '<select id="inp-peak-type">' +
+              '<option value="narrow">Narrow — TFs, H3K4me3, H3K27ac</option>' +
+              '<option value="broad">Broad — H3K27me3, H3K9me3, H3K36me3</option>' +
+            '</select>' +
+          '</div>' +
+          '<div class="field full">' +
+            '<label>Output format</label>' +
+            '<select id="inp-format">' +
+              '<option value="matrix">DESeq2 / edgeR — consensus-peak counts + coldata</option>' +
+              '<option value="obama">OBAMA matrix (experimental — peak-coordinate features)</option>' +
+              '<option value="both">Both</option>' +
+            '</select>' +
+          '</div>' +
+          '<div class="hint">Samplesheet may add a <code>control</code> column naming each ' +
+            'ChIP sample\\u2019s input; rows with <code>group=input</code> become the MACS2 control.</div>';
       }
       _wireBrowse(ef);
     }
@@ -1553,6 +1578,10 @@ async function startRun() {
     }
     if (track === "atacseq") {
       body.output_format = (document.getElementById("inp-format") || {value:"obama"}).value;
+    }
+    if (track === "chipseq") {
+      body.output_format = (document.getElementById("inp-format") || {value:"matrix"}).value;
+      body.peak_type = (document.getElementById("inp-peak-type") || {value:"narrow"}).value;
     }
   }
 

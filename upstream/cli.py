@@ -4,6 +4,7 @@ Usage:
   htsprep qc         --samples samples.csv --outdir results/
   htsprep rnaseq     --samples samples.csv --star-index /ref/star --salmon-index /ref/salmon --outdir results/
   htsprep atacseq    --samples samples.csv --bowtie2-index /ref/bt2/hg38 --outdir results/
+  htsprep chipseq    --samples samples.csv --bowtie2-index /ref/bt2/hg38 --peak-type narrow --outdir results/
   htsprep methylation --samples samples.csv --bismark-genome /ref/bismark --outdir results/
 
 Explanations are shown by default. Use --no-explain to suppress them.
@@ -49,7 +50,7 @@ ExplainOpt = Annotated[bool, typer.Option("--explain/--no-explain",
 # ── Helpers ───────────────────────────────────────────────────────────────
 
 
-def _read_samplesheet(path: Path) -> list[dict[str, str]]:
+def _read_samplesheet(path: Path, allow_input: bool = False) -> list[dict[str, str]]:
     if not path.exists():
         _die(f"Samplesheet not found: {path}")
     with path.open() as f:
@@ -59,11 +60,14 @@ def _read_samplesheet(path: Path) -> list[dict[str, str]]:
             _die(f"Samplesheet is missing columns: {', '.join(sorted(missing_cols))}")
         rows = list(reader)
 
+    valid_groups = {"disease", "control"} | ({"input"} if allow_input else set())
     for row in rows:
-        if row["group"] not in ("disease", "control"):
+        if row["group"] not in valid_groups:
+            extra = " or 'input'" if allow_input else ""
             _die(
                 f"Invalid group '{row['group']}' for sample '{row['name']}'. "
-                "Must be 'disease' or 'control' (OBAMA requires these exact strings)."
+                f"Must be 'disease' or 'control'{extra} (OBAMA requires the exact strings "
+                "'disease'/'control')."
             )
         # r1 is always required; r2 is optional (empty = single-end).
         if not Path(row["r1"]).exists():
@@ -101,6 +105,61 @@ def _fastp_cmd(
     ]
     cmd += [f for f in extra if not (f == "--detect_adapter_for_pe" and not paired)]
     return cmd, out1, out2
+
+
+def _build_peak_outputs(
+    results: list[tuple[str, str, Path, Path]],  # (name, group, peak_file, filtered_bam)
+    outdir: Path,
+    output_format: str,
+    threads: int,
+    explain: bool,
+    export_doc: str,
+) -> list[Path]:
+    """Write peak-based outputs (ATAC-seq / ChIP-seq), returning files written.
+
+    'obama' → peak-score matrix (samples × peaks). 'matrix' → consensus peak set +
+    per-peak read counts (deeptools multiBamSummary) → counts_matrix.csv + coldata.csv
+    for DESeq2/edgeR. 'both' → both.
+    """
+    written: list[Path] = []
+
+    if output_format in ("obama", "both"):
+        obama_path = outdir / "obama_matrix.csv"
+        obama.build_atacseq([(n, g, pf) for n, g, pf, _b in results], obama_path)
+        _check(*checkpoints.check_obama_format(obama_path))
+        written.append(obama_path)
+
+    if output_format in ("matrix", "both"):
+        if explain:
+            _explain(export_doc)
+        consensus_bed = outdir / "consensus_peaks.bed"
+        n_peaks = obama.build_atac_consensus([r[2] for r in results], consensus_bed)
+        console.print(f"  Consensus peak set: {n_peaks:,} merged regions → {consensus_bed.name}")
+
+        raw = outdir / "_multibamsummary_raw.tab"
+        npz = outdir / "_multibamsummary.npz"
+        rc = runner.run([
+            "multiBamSummary", "BED-file",
+            "--BED",          str(consensus_bed),
+            "--bamfiles",     *[str(r[3]) for r in results],
+            "--labels",       *[r[0] for r in results],
+            "-p",             str(threads),
+            "--outRawCounts", str(raw),
+            "-o",             str(npz),
+        ])
+        if rc != 0:
+            _die("multiBamSummary (deeptools) failed — are the filtered BAMs indexed?")
+        counts_path = outdir / "counts_matrix.csv"
+        coldata_path = outdir / "coldata.csv"
+        obama.build_atac_counts_matrix(
+            raw, [(n, g) for n, g, _pf, _b in results], counts_path, coldata_path,
+        )
+        npz.unlink(missing_ok=True)
+        raw.unlink(missing_ok=True)
+        _check(*checkpoints.check_counts_matrix(counts_path, coldata_path))
+        written += [counts_path, coldata_path]
+
+    return written
 
 
 def _die(msg: str) -> None:
@@ -485,45 +544,165 @@ def atacseq(
 
     # 5 — Build output matrices
     runner.step_header("Build matrix output", 5, TOTAL)
-    written: list[Path] = []
+    written = _build_peak_outputs(atac_results, outdir, output_format, threads,
+                                  explain, "atacseq_export_formats.md")
+    console.print(f"\n[bold green]Done.[/bold green] Wrote: {', '.join(p.name for p in written)} → {outdir}")
 
-    if output_format in ("obama", "both"):
-        obama_path = outdir / "obama_matrix.csv"
-        obama.build_atacseq([(n, g, pf) for n, g, pf, _b in atac_results], obama_path)
-        _check(*checkpoints.check_obama_format(obama_path))
-        written.append(obama_path)
 
-    if output_format in ("matrix", "both"):
+# ── ChIP-seq ─────────────────────────────────────────────────────────────────
+
+
+@app.command()
+def chipseq(
+    samples: SamplesOpt,
+    bowtie2_index: Annotated[Path, typer.Option("--bowtie2-index", help="Bowtie2 index prefix (path/to/hg38)")],
+    outdir: OutdirOpt,
+    peak_type: Annotated[str, typer.Option(
+        "--peak-type",
+        help="'narrow' (default; TFs, H3K4me3, H3K27ac) or 'broad' (H3K27me3, H3K9me3, H3K36me3).",
+    )] = "narrow",
+    output_format: Annotated[str, typer.Option(
+        "--format",
+        help="Output: 'matrix' (default; consensus-peak counts + coldata for DESeq2/edgeR), "
+             "'obama' (peak-score matrix — experimental for peaks: OBAMA's gene-based "
+             "interpretation needs peak→gene annotation), or 'both'.",
+    )] = "matrix",
+    threads: ThreadsOpt = 4,
+    explain: ExplainOpt = True,
+) -> None:
+    """ChIP-seq: fastp → Bowtie2 → filter → MACS2 (optional input control) → matrix.
+
+    The samplesheet may add an optional 'control' column naming each ChIP sample's
+    input by 'name'; rows with group=input are aligned to provide that control BAM
+    but are not peak-called or placed in the matrix. --peak-type broad calls broad
+    domains (histone marks). Default output is a consensus-peak count matrix for
+    DESeq2/edgeR differential binding (the validated downstream for peak data;
+    OBAMA's gene-centric modules need peak→gene annotation, so --format obama is
+    experimental for ChIP).
+    """
+    if peak_type not in ("narrow", "broad"):
+        _die("--peak-type must be 'narrow' or 'broad'.")
+    if output_format not in ("obama", "matrix", "both"):
+        _die("--format must be 'obama', 'matrix', or 'both'.")
+    broad = peak_type == "broad"
+
+    sample_list = _read_samplesheet(samples, allow_input=True)
+    inputs = {s["name"]: s for s in sample_list if s["group"] == "input"}
+    signal = [s for s in sample_list if s["group"] != "input"]
+    if not signal:
+        _die("No ChIP signal samples found (every row is group=input).")
+    for s in signal:
+        ctl = (s.get("control") or "").strip()
+        if ctl and ctl not in inputs:
+            _die(f"control '{ctl}' for sample '{s['name']}' must name a group=input row.")
+
+    bt2_prefix = bowtie2_index
+    outdir.mkdir(parents=True, exist_ok=True)
+
+    TOTAL = 5
+    n_in = len(inputs)
+    console.print(
+        f"\n[bold]ChIP-seq pipeline[/bold] ({peak_type}) — {len(signal)} ChIP sample(s)"
+        + (f" + {n_in} input(s)" if n_in else " (no input control)")
+        + f" → {outdir}\n"
+    )
+
+    # Align + filter every sample, inputs first so control BAMs exist before peak-calling.
+    ordered = list(inputs.values()) + signal
+    bam_for: dict[str, Path] = {}
+    chip_results: list[tuple[str, str, Path, Path]] = []
+
+    for s in ordered:
+        name, group = s["name"], s["group"]
+        paired = _is_paired(s)
+        sdir = outdir / name
+        sdir.mkdir(exist_ok=True)
+        layout = "paired-end" if paired else "single-end"
+        role = "input/control" if group == "input" else group
+        console.rule(f"[bold white]Sample: {name}  ({role})  [{layout}][/bold white]", style="white")
+
+        # 1 — Trim
+        runner.step_header("Trim — fastp", 1, TOTAL)
         if explain:
-            _explain("atacseq_export_formats.md")
-        # Consensus peak set (merge of all samples' peaks), then count reads per peak.
-        consensus_bed = outdir / "consensus_peaks.bed"
-        n_peaks = obama.build_atac_consensus([r[2] for r in atac_results], consensus_bed)
-        console.print(f"  Consensus peak set: {n_peaks:,} merged regions → {consensus_bed.name}")
+            _explain("chipseq_trim.md")
+        trim_dir = sdir / "trimmed"
+        trim_dir.mkdir(exist_ok=True)
+        cmd, t_r1, t_r2 = _fastp_cmd(s, name, trim_dir, threads, ["--detect_adapter_for_pe"])
+        if runner.run(cmd) != 0:
+            _die(f"fastp failed for sample '{name}'.")
+        _check(*checkpoints.check_fastp_trim(trim_dir / f"{name}_fastp.json"))
 
-        raw = outdir / "_multibamsummary_raw.tab"
-        npz = outdir / "_multibamsummary.npz"
-        rc = runner.run([
-            "multiBamSummary", "BED-file",
-            "--BED",       str(consensus_bed),
-            "--bamfiles",  *[str(r[3]) for r in atac_results],
-            "--labels",    *[r[0] for r in atac_results],
-            "-p",          str(threads),
-            "--outRawCounts", str(raw),
-            "-o",          str(npz),
-        ])
-        if rc != 0:
-            _die("multiBamSummary (deeptools) failed — are the filtered BAMs indexed?")
-        counts_path = outdir / "counts_matrix.csv"
-        coldata_path = outdir / "coldata.csv"
-        obama.build_atac_counts_matrix(
-            raw, [(n, g) for n, g, _pf, _b in atac_results], counts_path, coldata_path,
+        # 2 — Align
+        runner.step_header("Align — Bowtie2", 2, TOTAL)
+        if explain:
+            _explain("chipseq_align.md")
+        aln_dir = sdir / "aligned"
+        aln_dir.mkdir(exist_ok=True)
+        bam_raw = aln_dir / f"{name}.bam"
+        reads = (["-1", str(t_r1), "-2", str(t_r2), "--no-mixed", "--no-discordant", "-X", "2000"]
+                 if paired else ["-U", str(t_r1)])
+        rc = runner.pipe(
+            ["bowtie2", "--threads", str(threads), "-x", str(bt2_prefix), *reads, "--very-sensitive"],
+            ["samtools", "sort", "-o", str(bam_raw), "-"],
         )
-        npz.unlink(missing_ok=True)
-        raw.unlink(missing_ok=True)
-        _check(*checkpoints.check_counts_matrix(counts_path, coldata_path))
-        written += [counts_path, coldata_path]
+        if rc != 0:
+            _die(f"Bowtie2/samtools alignment failed for sample '{name}'.")
+        runner.run(["samtools", "index", str(bam_raw)])
+        _check(*checkpoints.check_bowtie2_bam(bam_raw))
 
+        # 3 — Filter
+        runner.step_header("Filter — dedup, MAPQ ≥ 30, remove mito", 3, TOTAL)
+        if explain:
+            _explain("chipseq_filter.md")
+        filt_dir = sdir / "filtered"
+        filt_dir.mkdir(exist_ok=True)
+        autosomes = [f"chr{c}" for c in list(range(1, 23)) + ["X", "Y"]]
+        bam_nomito = filt_dir / f"{name}.nomito.bam"
+        bam_dedup  = filt_dir / f"{name}.dedup.bam"
+        bam_final  = filt_dir / f"{name}.filtered.bam"
+        for cmd in [
+            ["samtools", "view", "-b", str(bam_raw)] + autosomes + ["-o", str(bam_nomito)],
+            ["samtools", "index", str(bam_nomito)],
+            ["samtools", "markdup", "-r", str(bam_nomito), str(bam_dedup)],
+            ["samtools", "index", str(bam_dedup)],
+            ["samtools", "view", "-b", "-q", "30", str(bam_dedup), "-o", str(bam_final)],
+            ["samtools", "index", str(bam_final)],
+        ]:
+            if runner.run(cmd) != 0:
+                _die(f"Filtering failed at: {' '.join(str(c) for c in cmd[:3])}")
+        _check(*checkpoints.check_atac_filtered_bam(bam_final))
+        bam_for[name] = bam_final
+
+        if group == "input":
+            console.print(f"  [dim]{name}: input/control — aligned + filtered, not peak-called.[/dim]")
+            continue
+
+        # 4 — Peaks: ChIP-correct MACS2 (model-based narrow, or --broad; optional -c input).
+        # NOT ATAC's --nomodel/--shift/--extsize, which model the Tn5 cut site.
+        runner.step_header("Peak calling — MACS2", 4, TOTAL)
+        if explain:
+            _explain("chipseq_peaks.md")
+        peaks_dir = sdir / "peaks"
+        peaks_dir.mkdir(exist_ok=True)
+        ctl = (s.get("control") or "").strip()
+        control_bam = bam_for.get(ctl) if ctl else None
+        macs2_cmd = ["macs2", "callpeak", "-t", str(bam_final)]
+        if control_bam:
+            macs2_cmd += ["-c", str(control_bam)]
+        macs2_cmd += ["-f", "BAMPE" if paired else "BAM", "-g", "hs",
+                      "--outdir", str(peaks_dir), "-n", name]
+        if broad:
+            macs2_cmd += ["--broad", "--broad-cutoff", "0.1"]
+        if runner.run(macs2_cmd) != 0:
+            _die(f"MACS2 peak calling failed for sample '{name}'.")
+        peak_file = peaks_dir / f"{name}_peaks.{'broadPeak' if broad else 'narrowPeak'}"
+        _check(*checkpoints.check_chip_peaks(peak_file, broad))
+        chip_results.append((name, group, peak_file, bam_final))
+
+    # 5 — Build output matrices
+    runner.step_header("Build matrix output", 5, TOTAL)
+    written = _build_peak_outputs(chip_results, outdir, output_format, threads,
+                                  explain, "chipseq_export_formats.md")
     console.print(f"\n[bold green]Done.[/bold green] Wrote: {', '.join(p.name for p in written)} → {outdir}")
 
 
@@ -713,7 +892,7 @@ def methylation(
 def download(
     track: Annotated[Optional[str], typer.Option(
         "--track",
-        help="Track to set up: rnaseq, atacseq, methylation, qc. Omit to list all.",
+        help="Track to set up: rnaseq, atacseq, chipseq, methylation, qc. Omit to list all.",
     )] = None,
     outdir: Annotated[Path, typer.Option(
         "--outdir",

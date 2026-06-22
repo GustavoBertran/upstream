@@ -111,6 +111,21 @@ def check_macs2_peaks(peak_file: Path) -> tuple[bool, str]:
     return True, f"{n:,} peaks called."
 
 
+def check_chip_peaks(peak_file: Path, broad: bool = False) -> tuple[bool, str]:
+    """Validate ChIP-seq peaks. Unlike ATAC, broad histone domains are legitimately
+    few and wide, so this only requires that some peaks were called."""
+    if not peak_file.exists():
+        return False, f"Peak file not found: {peak_file.name}"
+    n = len([l for l in peak_file.read_text().splitlines() if l.strip()])
+    if n == 0:
+        return (
+            False,
+            f"No peaks called in {peak_file.name}. Check IP enrichment, the input "
+            "control, and that --peak-type matches the mark (narrow vs broad).",
+        )
+    return True, f"{n:,} {'broad domain' if broad else 'narrow peak'}(s) called."
+
+
 # ── Methylation ──────────────────────────────────────────────────────────
 
 
