@@ -517,6 +517,22 @@ input:checked+.slider::before{transform:translateX(14px)}
 .csv-col-tag input[type=checkbox]{width:11px;height:11px;margin:0;cursor:pointer;
                                    accent-color:var(--accent)}
 .csv-col-tag.checked{border-color:var(--accent);color:var(--bright)}
+/* collapsible info note (paired vs single-end) */
+.info-note{background:var(--bg3);border:1px solid var(--border);border-radius:6px;
+           margin-bottom:.875rem;font-size:.76rem;overflow:hidden}
+.info-note summary{cursor:pointer;padding:.5rem .75rem;color:var(--accent);
+                   user-select:none;list-style:none;font-weight:600}
+.info-note summary::-webkit-details-marker{display:none}
+.info-note summary::before{content:"\\25B8";display:inline-block;margin-right:.45rem;
+                           font-size:.7rem;transition:transform .15s}
+.info-note[open] summary::before{transform:rotate(90deg)}
+.info-note[open] summary{border-bottom:1px solid var(--border)}
+.info-note-body{padding:.65rem .85rem;color:var(--text);line-height:1.65}
+.info-note-body p{margin-bottom:.5rem}
+.info-note-body p:last-child{margin-bottom:0}
+.info-note-body strong{color:var(--bright)}
+.info-note-body code{background:var(--bg2);padding:.05rem .3rem;border-radius:3px;
+                     font-size:.72rem}
 </style>
 </head>
 <body>
@@ -588,6 +604,26 @@ input:checked+.slider::before{transform:translateX(14px)}
 
     <!-- GEO download panel (shown only for download track) -->
     <div id="geo-panel">
+      <details class="info-note">
+        <summary>Paired-end vs single-end reads</summary>
+        <div class="info-note-body">
+          <p><strong>Paired-end</strong> sequencing reads each DNA fragment from
+          <em>both</em> ends, producing two FASTQ files per sample &mdash; <code>R1</code>
+          (forward) and <code>R2</code> (reverse). Knowing both ends and the distance
+          between them improves alignment accuracy and helps detect splice junctions,
+          insertions/deletions, and structural rearrangements. SRA labels these
+          <code>PAIRED</code>, and download tools split them into <code>_1.fastq</code>
+          and <code>_2.fastq</code>.</p>
+          <p><strong>Single-end</strong> sequencing reads each fragment from
+          <em>one</em> end only, producing a single FASTQ file per sample. It is cheaper
+          and faster and is perfectly adequate for straightforward read counting, such as
+          standard RNA-seq quantification or basic peak calling. SRA labels these
+          <code>SINGLE</code>.</p>
+          <p>Neither is universally better: paired-end gives more positional information
+          per fragment, while single-end costs less. The right choice depends on the
+          experiment &mdash; the GEO/SRA record for a dataset tells you which was used.</p>
+        </div>
+      </details>
       <div class="geo-fetch-row">
         <div class="field">
           <label>GEO Series Accession</label>
