@@ -1,0 +1,1063 @@
+"""
+Web UI server for the upstream teaching tool.
+
+Students launch with `upstream serve`, then open http://localhost:<port> in
+a browser.  The actual pipeline tools still run on the server; output is
+streamed back to the browser in real-time via Server-Sent Events.
+
+Architecture:
+  POST /api/run   → spawns `upstream <track> ...` as a subprocess in a thread;
+                    returns a run_id
+  GET  /api/stream/<run_id> → SSE feed of captured lines
+  POST /api/cancel/<run_id> → SIGTERM the subprocess
+"""
+from __future__ import annotations
+
+import json
+import re
+import shutil
+import subprocess
+import sys
+import threading
+import uuid
+from pathlib import Path
+from typing import Optional
+
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import HTMLResponse, StreamingResponse
+from pydantic import BaseModel
+
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]")
+
+app = FastAPI(title="upstream", docs_url=None, redoc_url=None)
+
+# run_id → {"status": "running"|"done"|"error"|"cancelled",
+#            "lines": [{"text": str, "cls": str}],
+#            "proc": Popen | None,
+#            "exit_code": int | None}
+_runs: dict[str, dict] = {}
+_runs_lock = threading.Lock()
+
+
+# ── Request model ─────────────────────────────────────────────────────────
+
+
+class RunRequest(BaseModel):
+    track: str
+    samples: Optional[str] = None
+    outdir: str = "results/"
+    threads: int = 4
+    explain: bool = True
+    # rnaseq aligner choice
+    aligner: Optional[str] = None
+    # legacy catalog download
+    data_track: Optional[str] = None
+    # geo download
+    geo_samples: Optional[list] = None
+    # track-specific index paths
+    star_index: Optional[str] = None
+    salmon_index: Optional[str] = None
+    bowtie2_index: Optional[str] = None
+    bismark_genome: Optional[str] = None
+    # methylation array
+    method: Optional[str] = None
+    betas: Optional[str] = None
+    metadata_csv: Optional[str] = None
+
+
+# ── Routes ────────────────────────────────────────────────────────────────
+
+
+@app.get("/", response_class=HTMLResponse)
+def index() -> str:
+    return _HTML
+
+
+@app.post("/api/run")
+def start_run(req: RunRequest) -> dict:
+    run_id = uuid.uuid4().hex[:8]
+    with _runs_lock:
+        _runs[run_id] = {"status": "running", "lines": [], "proc": None, "exit_code": None}
+    threading.Thread(target=_run_pipeline, args=(run_id, req), daemon=True).start()
+    return {"run_id": run_id}
+
+
+@app.get("/api/stream/{run_id}")
+def stream(run_id: str) -> StreamingResponse:
+    if run_id not in _runs:
+        raise HTTPException(404, "run not found")
+    return StreamingResponse(_sse_generator(run_id), media_type="text/event-stream")
+
+
+@app.post("/api/cancel/{run_id}")
+def cancel(run_id: str) -> dict:
+    with _runs_lock:
+        run = _runs.get(run_id)
+    if run and run["proc"] and run["status"] == "running":
+        run["proc"].terminate()
+        run["status"] = "cancelled"
+    return {"ok": True}
+
+
+# ── Pipeline runner ───────────────────────────────────────────────────────
+
+
+def _upstream_argv() -> list[str]:
+    exe = shutil.which("upstream")
+    return [exe] if exe else [sys.executable, "-m", "upstream.cli"]
+
+
+def _build_cmd(req: RunRequest) -> list[str]:
+    if req.track == "download":
+        cmd = _upstream_argv() + ["download", "--outdir", req.outdir]
+        if req.data_track:
+            cmd += ["--track", req.data_track]
+        return cmd
+
+    if req.track == "methylation" and req.method == "array":
+        cmd = _upstream_argv() + [
+            "methylation",
+            "--method",   "array",
+            "--betas",    req.betas or "",
+            "--metadata", req.metadata_csv or "",
+            "--outdir",   req.outdir,
+        ]
+        if not req.explain:
+            cmd.append("--no-explain")
+        return cmd
+
+    cmd = _upstream_argv() + [
+        req.track,
+        "--samples", req.samples,
+        "--outdir",  req.outdir,
+        "--threads", str(req.threads),
+    ]
+    if not req.explain:
+        cmd.append("--no-explain")
+    if req.aligner:
+        cmd += ["--aligner", req.aligner]
+    if req.method:
+        cmd += ["--method", req.method]
+    if req.star_index:
+        cmd += ["--star-index", req.star_index]
+    if req.salmon_index:
+        cmd += ["--salmon-index", req.salmon_index]
+    if req.bowtie2_index:
+        cmd += ["--bowtie2-index", req.bowtie2_index]
+    if req.bismark_genome:
+        cmd += ["--bismark-genome", req.bismark_genome]
+    return cmd
+
+
+def _run_pipeline(run_id: str, req: RunRequest) -> None:
+    if req.track == "download_geo":
+        _run_geo_download(run_id, req)
+        return
+
+    run = _runs[run_id]
+    cmd = _build_cmd(req)
+    proc = subprocess.Popen(
+        cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1,
+    )
+    run["proc"] = proc
+    for raw in proc.stdout:
+        text = _ANSI_RE.sub("", raw).rstrip()
+        if text:
+            with _runs_lock:
+                run["lines"].append({"text": text, "cls": _classify(text)})
+    proc.wait()
+    with _runs_lock:
+        run["exit_code"] = proc.returncode
+        if run["status"] == "running":
+            run["status"] = "done" if proc.returncode == 0 else "error"
+
+
+def _run_geo_download(run_id: str, req: RunRequest) -> None:
+    import csv as _csv
+    run   = _runs[run_id]
+    outdir = Path(req.outdir)
+    outdir.mkdir(parents=True, exist_ok=True)
+    samples = req.geo_samples or []
+
+    def append(text: str, cls: str = "out") -> None:
+        with _runs_lock:
+            run["lines"].append({"text": text, "cls": cls})
+
+    def run_cmd(cmd: list[str]) -> int:
+        append("$ " + " ".join(str(c) for c in cmd), "cmd")
+        proc = subprocess.Popen(
+            [str(c) for c in cmd],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, bufsize=1,
+        )
+        run["proc"] = proc
+        for raw in proc.stdout:
+            t = _ANSI_RE.sub("", raw).rstrip()
+            if t:
+                append(t)
+        proc.wait()
+        return proc.returncode
+
+    csv_rows = []
+    for i, s in enumerate(samples):
+        srr, name, group = s["srr"], s["name"], s["group"]
+        append(f"── {i+1}/{len(samples)}  {name} ({group})  SRR: {srr}", "step")
+
+        r1 = outdir / f"{name}_R1.fastq.gz"
+        r2 = outdir / f"{name}_R2.fastq.gz"
+
+        if r1.exists() and r2.exists():
+            append(f"✓ {name}: files already present, skipping download.", "ok")
+        else:
+            rc = run_cmd(["fasterq-dump", "--split-files", "--outdir", str(outdir), "--progress", srr])
+            if rc != 0:
+                append(f"✗ fasterq-dump failed for {srr}.", "error")
+                run["status"] = "error"; run["exit_code"] = rc; return
+
+            append(f"  Subsampling {name} to 1,000,000 reads…")
+            for suffix, dest in [(f"{srr}_1.fastq", r1), (f"{srr}_2.fastq", r2)]:
+                src = outdir / suffix
+                p1 = subprocess.Popen(
+                    ["seqtk", "sample", "-s", "42", str(src), "1000000"],
+                    stdout=subprocess.PIPE,
+                )
+                with dest.open("wb") as fh:
+                    p2 = subprocess.Popen(["gzip"], stdin=p1.stdout, stdout=fh)
+                p1.stdout.close(); p2.wait(); p1.wait()
+                src.unlink(missing_ok=True)
+                if p2.returncode != 0:
+                    append("✗ seqtk/gzip failed.", "error")
+                    run["status"] = "error"; run["exit_code"] = 1; return
+
+            append(f"✓ {name} ready.", "ok")
+
+        csv_rows.append({"name": name, "group": group,
+                         "r1": str(r1.resolve()), "r2": str(r2.resolve())})
+
+    csv_path = outdir / "samples.csv"
+    with csv_path.open("w", newline="") as f:
+        w = _csv.DictWriter(f, fieldnames=["name", "group", "r1", "r2"])
+        w.writeheader(); w.writerows(csv_rows)
+
+    append(f"✓ samples.csv written → {csv_path}", "ok")
+    append("Done. Run the pipeline with:", "success")
+    append(f"  upstream rnaseq --samples {csv_path} --outdir results/", "cmd")
+    run["status"] = "done"; run["exit_code"] = 0
+
+
+def _classify(text: str) -> str:
+    t = text.strip()
+    if re.search(r"\d+/\d+ —", t):
+        return "step"
+    if t.startswith("✓"):
+        return "ok"
+    if t.startswith("✗") or re.search(r"[Ee]rror:", t):
+        return "error"
+    if t.startswith("$"):
+        return "cmd"
+    if re.match(r"\[bold green\]", t) or ("Done." in t and len(t) < 80):
+        return "success"
+    return "out"
+
+
+# ── GEO metadata routes ───────────────────────────────────────────────────
+
+
+@app.get("/api/geo/{gse}")
+def geo_series(gse: str) -> dict:
+    from . import geo
+    try:
+        return geo.fetch_series(gse)
+    except ValueError as e:
+        raise HTTPException(404, str(e))
+
+
+@app.get("/api/geo/srr/{gsm}")
+def geo_srr(gsm: str) -> dict:
+    from . import geo
+    return {"gsm": gsm, "srrs": geo.fetch_srr(gsm)}
+
+
+@app.get("/api/browse")
+def browse(path: str = "~") -> dict:
+    """List directory contents for the in-browser file picker."""
+    import os
+    p = Path(path).expanduser()
+    if not p.exists():
+        p = p.parent
+    if not p.is_dir():
+        p = p.parent
+    if not p.exists():
+        p = Path.home()
+
+    entries = []
+    try:
+        for child in sorted(p.iterdir(), key=lambda x: (not x.is_dir(), x.name.lower())):
+            if child.name.startswith("."):
+                continue
+            try:
+                entries.append({"name": child.name, "path": str(child), "is_dir": child.is_dir()})
+            except (PermissionError, OSError):
+                pass
+    except (PermissionError, OSError):
+        pass
+
+    parent = str(p.parent) if p != p.parent else None
+    return {"path": str(p), "parent": parent, "entries": entries}
+
+
+# ── SSE generator ─────────────────────────────────────────────────────────
+
+
+async def _sse_generator(run_id: str):
+    run = _runs[run_id]
+    sent = 0
+    import asyncio
+    while True:
+        await asyncio.sleep(0.05)
+        with _runs_lock:
+            batch = run["lines"][sent:]
+            status = run["status"]
+            exit_code = run["exit_code"]
+        for line in batch:
+            yield f"data: {json.dumps(line)}\n\n"
+            sent += 1
+        if status != "running" and sent >= len(run["lines"]):
+            yield f"data: {json.dumps({'done': True, 'exit_code': exit_code, 'status': status})}\n\n"
+            return
+
+
+# ── HTML ──────────────────────────────────────────────────────────────────
+
+_HTML = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>upstream</title>
+<style>
+:root{
+  --bg:#1a1b26;--bg2:#24283b;--bg3:#1f2335;
+  --border:#414868;--text:#a9b1d6;--bright:#c0caf5;
+  --accent:#7aa2f7;--green:#9ece6a;--red:#f7768e;
+  --yellow:#e0af68;--cyan:#7dcfff;--dim:#565f89;
+}
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:var(--bg);color:var(--text);font-family:system-ui,sans-serif;
+     height:100vh;display:flex;overflow:hidden}
+/* sidebar */
+.sidebar{width:220px;min-width:220px;background:var(--bg2);
+         border-right:1px solid var(--border);display:flex;
+         flex-direction:column;padding:1.25rem .875rem;gap:.75rem;overflow-y:auto}
+.sidebar h1{font-size:1rem;color:var(--accent);font-weight:700;
+            letter-spacing:.05em;padding-bottom:.75rem;
+            border-bottom:1px solid var(--border)}
+.sidebar h2{font-size:.65rem;text-transform:uppercase;letter-spacing:.1em;
+            color:var(--dim);margin-bottom:.3rem}
+.track-btn{background:none;border:1px solid transparent;border-radius:6px;
+           color:var(--text);cursor:pointer;padding:.45rem .65rem;
+           text-align:left;width:100%;transition:all .15s}
+.track-btn:hover{background:var(--bg3);border-color:var(--border)}
+.track-btn.active{background:var(--bg3);border-color:var(--accent);color:var(--bright)}
+.track-btn .tn{font-weight:600;font-size:.825rem}
+.track-btn .td{font-size:.68rem;color:var(--dim);margin-top:.15rem;line-height:1.3}
+.sidebar-footer{margin-top:auto;font-size:.68rem;color:var(--dim);line-height:1.6;
+                padding-top:.75rem;border-top:1px solid var(--border)}
+/* main */
+.main{flex:1;display:flex;flex-direction:column;padding:1.75rem;gap:1.25rem;
+      overflow-y:auto;min-width:0}
+/* form */
+.panel-title{font-size:.95rem;color:var(--bright);font-weight:600;margin-bottom:1rem}
+.grid{display:grid;grid-template-columns:1fr 1fr;gap:.875rem}
+.field{display:flex;flex-direction:column;gap:.35rem}
+.field.full{grid-column:1/-1}
+.field label{font-size:.68rem;text-transform:uppercase;letter-spacing:.06em;color:var(--dim)}
+.field input,.field select{
+  background:var(--bg2);border:1px solid var(--border);border-radius:4px;
+  color:var(--bright);font-family:monospace;font-size:.825rem;
+  padding:.45rem .65rem;outline:none;transition:border-color .15s}
+.field input:focus,.field select:focus{border-color:var(--accent)}
+.hint{font-size:.68rem;color:var(--dim);margin-top:.25rem}
+.hint code{background:var(--bg3);padding:.05rem .3rem;border-radius:3px}
+.actions{display:flex;gap:.625rem;align-items:center;margin-top:1.125rem}
+.btn{background:var(--accent);border:none;border-radius:6px;color:#1a1b26;
+     cursor:pointer;font-size:.825rem;font-weight:700;padding:.5rem 1.25rem;
+     transition:opacity .15s;white-space:nowrap}
+.btn:hover{opacity:.85}
+.btn.danger{background:var(--red)}
+.btn.ghost{background:none;border:1px solid var(--border);color:var(--text)}
+.btn:disabled{opacity:.4;cursor:not-allowed}
+/* toggle */
+.toggle-row{display:flex;align-items:center;gap:.625rem}
+.toggle{position:relative;display:inline-block;width:32px;height:18px}
+.toggle input{opacity:0;width:0;height:0}
+.slider{position:absolute;inset:0;background:var(--border);border-radius:18px;
+        cursor:pointer;transition:background .2s}
+.slider::before{content:"";position:absolute;width:12px;height:12px;border-radius:50%;
+                background:white;left:3px;top:3px;transition:transform .2s}
+input:checked+.slider{background:var(--accent)}
+input:checked+.slider::before{transform:translateX(14px)}
+/* geo download panel */
+#geo-panel{display:none}
+.geo-fetch-row{display:flex;gap:.5rem;align-items:flex-end;margin-bottom:.875rem}
+.geo-fetch-row .field{flex:1;max-width:300px}
+#geo-msg{font-size:.74rem;min-height:1.1em;margin-bottom:.5rem}
+#geo-series-info{font-size:.78rem;color:var(--dim);margin-bottom:.75rem}
+.geo-table-wrap{overflow-x:auto;border:1px solid var(--border);border-radius:6px;margin-bottom:1rem}
+.geo-table{width:100%;border-collapse:collapse;font-size:.775rem}
+.geo-table th,.geo-table td{padding:.4rem .7rem;text-align:left;border-bottom:1px solid var(--border)}
+.geo-table tr:last-child td{border-bottom:none}
+.geo-table th{color:var(--dim);text-transform:uppercase;font-size:.65rem;
+              letter-spacing:.07em;background:var(--bg3)}
+.geo-table select{background:var(--bg2);border:1px solid var(--border);
+                  border-radius:3px;color:var(--bright);font-size:.775rem;padding:.2rem .4rem}
+.srr-cell{font-family:monospace;color:var(--cyan);font-size:.72rem}
+.srr-err{color:var(--red);font-size:.72rem}
+.geo-dl-row{display:flex;align-items:flex-end;gap:.875rem;flex-wrap:wrap}
+/* log panel */
+#log-panel{flex:1;display:flex;flex-direction:column;gap:.75rem;min-height:0}
+.log-header{display:flex;justify-content:space-between;align-items:flex-start;flex-shrink:0}
+.log-header h2{font-size:.95rem;color:var(--bright);font-weight:600}
+.steps{display:flex;gap:.4rem;align-items:center;margin-top:.4rem}
+.dot{width:8px;height:8px;border-radius:50%;background:var(--border);transition:background .25s}
+.dot.done{background:var(--green)}
+.dot.active{background:var(--accent)}
+.dot.err{background:var(--red)}
+.log{flex:1;background:var(--bg2);border:1px solid var(--border);border-radius:6px;
+     font-family:monospace;font-size:.775rem;overflow-y:auto;padding:.875rem;
+     line-height:1.65;min-height:0}
+.ll{white-space:pre-wrap;word-break:break-all}
+.ll.step{color:var(--cyan);font-weight:bold;margin-top:.5rem}
+.ll.ok{color:var(--green)}
+.ll.error{color:var(--red)}
+.ll.cmd{color:var(--dim)}
+.ll.success{color:var(--green);font-weight:bold}
+.status-bar{font-size:.72rem;color:var(--dim);display:flex;align-items:center;
+            gap:.4rem;flex-shrink:0}
+@keyframes spin{to{transform:rotate(360deg)}}
+.spin{display:inline-block;animation:spin .9s linear infinite}
+/* file browser */
+.field-row{display:flex;gap:.4rem;align-items:stretch}
+.field-row input{flex:1;min-width:0}
+.browse-btn{background:var(--bg2);border:1px solid var(--border);border-radius:4px;
+            color:var(--dim);cursor:pointer;padding:0 .6rem;font-size:.75rem;
+            white-space:nowrap;transition:all .15s;flex-shrink:0}
+.browse-btn:hover{border-color:var(--accent);color:var(--bright)}
+.browser-modal{display:none;position:fixed;inset:0;background:rgba(0,0,0,.65);
+               z-index:100;align-items:center;justify-content:center}
+.browser-modal.open{display:flex}
+.browser-box{background:var(--bg2);border:1px solid var(--border);border-radius:8px;
+             width:560px;max-width:calc(100vw - 2rem);max-height:80vh;
+             display:flex;flex-direction:column;overflow:hidden}
+.browser-header{padding:.65rem 1rem;border-bottom:1px solid var(--border);
+                display:flex;gap:.5rem;align-items:center}
+.browser-path{font-size:.72rem;font-family:monospace;color:var(--bright);
+              flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.browser-bar{padding:.4rem .75rem;border-bottom:1px solid var(--border)}
+.browser-list{flex:1;overflow-y:auto;max-height:52vh;padding:.25rem 0}
+.browser-row{display:flex;align-items:center;gap:.5rem;padding:.32rem .85rem;
+             cursor:pointer;font-size:.78rem;color:var(--text)}
+.browser-row:hover{background:var(--bg3);color:var(--bright)}
+.browser-icon{flex-shrink:0;opacity:.7}
+</style>
+</head>
+<body>
+
+<div class="sidebar">
+  <h1>&#9889; upstream</h1>
+  <div>
+    <h2>Track</h2>
+    <div id="track-list" style="display:flex;flex-direction:column;gap:.2rem;margin-top:.4rem"></div>
+  </div>
+  <div class="sidebar-footer">
+    Pipeline runs on the server.<br>
+    Output streams here live.
+  </div>
+</div>
+
+<!-- File browser modal -->
+<div class="browser-modal" id="browser-modal">
+  <div class="browser-box">
+    <div class="browser-header">
+      <span class="browser-path" id="browser-path"></span>
+      <button class="btn ghost" onclick="closeBrowser()" style="padding:.3rem .65rem;font-size:.72rem">Cancel</button>
+    </div>
+    <div class="browser-bar" id="browser-bar">
+      <button class="btn" onclick="selectBrowserDir()" style="padding:.3rem .75rem;font-size:.75rem">Select this folder</button>
+    </div>
+    <div class="browser-list" id="browser-list"></div>
+  </div>
+</div>
+
+<div class="main">
+
+  <!-- Setup panel -->
+  <div id="setup-panel">
+    <div class="panel-title" id="form-title">Select a track to begin</div>
+
+    <!-- Standard fields (hidden for download track) -->
+    <div class="grid" id="standard-grid">
+      <div class="field full">
+        <label>Samples CSV</label>
+        <div class="field-row">
+          <input id="inp-samples" type="text" placeholder="/data/upstream/shared/fastq/rnaseq/samples.csv">
+          <button class="browse-btn" onclick="openBrowser('inp-samples','file')">...</button>
+        </div>
+        <div class="hint">Generate with: <code>upstream download --track &lt;track&gt; --outdir .</code></div>
+      </div>
+      <div class="field">
+        <label>Output directory</label>
+        <div class="field-row">
+          <input id="inp-outdir" type="text" value="results/">
+          <button class="browse-btn" onclick="openBrowser('inp-outdir','dir')">...</button>
+        </div>
+      </div>
+      <div class="field">
+        <label>CPU threads</label>
+        <input id="inp-threads" type="number" value="4" min="1" max="64">
+      </div>
+      <div id="extra-fields" style="display:contents"></div>
+      <div class="field full">
+        <div class="toggle-row">
+          <label class="toggle">
+            <input type="checkbox" id="inp-explain" checked>
+            <span class="slider"></span>
+          </label>
+          <span style="font-size:.825rem">Show step explanations</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- GEO download panel (shown only for download track) -->
+    <div id="geo-panel">
+      <div class="geo-fetch-row">
+        <div class="field">
+          <label>GEO Series Accession</label>
+          <input id="inp-gse" type="text" placeholder="GSE12345"
+                 style="text-transform:uppercase"
+                 onkeydown="if(event.key==='Enter')fetchGSE()">
+        </div>
+        <button class="btn ghost" id="btn-fetch" onclick="fetchGSE()">Fetch metadata</button>
+      </div>
+      <div id="geo-msg" style="color:var(--red)"></div>
+
+      <div id="geo-results" style="display:none">
+        <div id="geo-series-info"></div>
+        <div class="geo-table-wrap">
+          <table class="geo-table">
+            <thead>
+              <tr>
+                <th>Sample (GSM)</th><th>Title</th><th>Group</th><th>SRR</th>
+              </tr>
+            </thead>
+            <tbody id="geo-tbody"></tbody>
+          </table>
+        </div>
+        <div class="geo-dl-row">
+          <div class="field" style="max-width:280px">
+            <label>Output directory</label>
+            <div class="field-row">
+              <input id="inp-geo-outdir" type="text" value="data/">
+              <button class="browse-btn" onclick="openBrowser('inp-geo-outdir','dir')">...</button>
+            </div>
+          </div>
+          <button class="btn" onclick="startGeoDownload()">Download selected</button>
+          <span id="geo-dl-msg" style="font-size:.74rem;color:var(--red)"></span>
+        </div>
+      </div>
+    </div>
+
+    <!-- Run Pipeline button (hidden for download track) -->
+    <div class="actions" id="run-actions" style="display:none">
+      <button class="btn" onclick="startRun()">Run Pipeline</button>
+      <span id="form-msg" style="font-size:.74rem;color:var(--red)"></span>
+    </div>
+  </div>
+
+  <!-- Log panel (hidden initially) -->
+  <div id="log-panel" style="display:none">
+    <div class="log-header">
+      <div>
+        <h2 id="log-title"></h2>
+        <div class="steps" id="steps-row"></div>
+      </div>
+      <div class="actions">
+        <button class="btn ghost" id="btn-newrun" onclick="newRun()" style="display:none">New run</button>
+        <button class="btn danger" id="btn-stop" onclick="stopRun()">Stop</button>
+      </div>
+    </div>
+    <div class="log" id="log"></div>
+    <div class="status-bar" id="log-status"><span class="spin">&#8635;</span>&nbsp;Running&hellip;</div>
+  </div>
+
+</div>
+
+<script>
+const TRACKS = {
+  rnaseq:      {label:"RNA-seq",      desc:"fastp → STAR or Salmon → OBAMA matrix",      nsteps:3, isRnaseq:true},
+  atacseq:     {label:"ATAC-seq",     desc:"fastp → Bowtie2 → filter → MACS2 → matrix",  nsteps:5, extra:["bowtie2-index"]},
+  methylation: {label:"Methylation",  desc:"WGBS (Bismark) or 450K/EPIC array (GEO beta matrix)",nsteps:4, isMethylation:true},
+  qc:          {label:"QC",           desc:"FastQC + MultiQC",                                    nsteps:2, extra:[]},
+  download:    {label:"Download Data",desc:"Browse GEO, pick conditions, fasterq-dump",          isDownload:true},
+};
+
+const EXTRA_INFO = {
+  "star-index":    {label:"STAR index directory",     ph:"/data/upstream/shared/indices/star_hg38"},
+  "salmon-index":  {label:"Salmon index directory",   ph:"/data/upstream/shared/indices/salmon_hg38"},
+  "bowtie2-index": {label:"Bowtie2 index prefix",     ph:"/data/upstream/shared/indices/bowtie2_hg38/hg38"},
+  "bismark-genome":{label:"Bismark genome directory", ph:"/data/upstream/shared/indices/bismark_hg38"},
+};
+
+let track = null, runId = null, sse = null, stepIdx = 0, _runNsteps = 0;
+
+// Build sidebar
+(function() {
+  const tl = document.getElementById("track-list");
+  for (const [id, t] of Object.entries(TRACKS)) {
+    const b = document.createElement("button");
+    b.className = "track-btn"; b.id = "tb-"+id;
+    b.innerHTML = '<div class="tn">'+t.label+'</div><div class="td">'+t.desc+'</div>';
+    b.onclick = () => selectTrack(id);
+    tl.appendChild(b);
+  }
+})();
+
+function selectTrack(id) {
+  if (runId) return;
+  track = id;
+  document.querySelectorAll(".track-btn").forEach(b => b.classList.remove("active"));
+  document.getElementById("tb-"+id).classList.add("active");
+  document.getElementById("form-title").textContent = TRACKS[id].label;
+  const fm = document.getElementById("form-msg"); if (fm) fm.textContent = "";
+
+  const isDownload     = !!TRACKS[id].isDownload;
+  const isRnaseq       = !!TRACKS[id].isRnaseq;
+  const isMethylation  = !!TRACKS[id].isMethylation;
+
+  document.getElementById("standard-grid").style.display = isDownload ? "none" : "";
+  document.getElementById("run-actions").style.display   = isDownload ? "none" : "";
+  document.getElementById("geo-panel").style.display     = isDownload ? "" : "none";
+
+  if (!isDownload) {
+    const ef = document.getElementById("extra-fields");
+    if (isRnaseq) {
+      ef.innerHTML =
+        '<div class="field full">' +
+          '<label>Aligner / quantifier</label>' +
+          '<select id="inp-aligner" onchange="updateAlignerField()">' +
+            '<option value="salmon">Salmon — alignment-free (recommended)</option>' +
+            '<option value="star">STAR — genome alignment + gene counts</option>' +
+          '</select>' +
+        '</div>' +
+        '<div class="field full" id="aligner-idx-field"></div>';
+      updateAlignerField();
+    } else if (isMethylation) {
+      ef.innerHTML =
+        '<div class="field full">' +
+          '<label>Method</label>' +
+          '<select id="inp-meth-method" onchange="updateMethylationMethod()">' +
+            '<option value="wgbs">WGBS — whole-genome bisulfite (Bismark)</option>' +
+            '<option value="array">450K / EPIC array — GEO beta matrix</option>' +
+          '</select>' +
+        '</div>' +
+        '<div id="meth-extra-fields" style="display:contents"></div>';
+      updateMethylationMethod();
+    } else {
+      ef.innerHTML = (TRACKS[id].extra || []).map(function(k) {
+        const i = EXTRA_INFO[k];
+        return '<div class="field full"><label>'+i.label+'</label>' +
+               '<div class="field-row">' +
+               '<input type="text" id="inp-'+k+'" placeholder="'+i.ph+'">' +
+               '<button class="browse-btn" onclick="openBrowser(\'inp-'+k+'\',\'dir\')">...</button>' +
+               '</div></div>';
+      }).join("");
+    }
+  }
+}
+
+function updateAlignerField() {
+  const sel = document.getElementById("inp-aligner");
+  const div = document.getElementById("aligner-idx-field");
+  if (!sel || !div) return;
+  if (sel.value === "salmon") {
+    div.innerHTML = '<label>Salmon index directory</label>' +
+      '<div class="field-row">' +
+        '<input type="text" id="inp-salmon-index" placeholder="'+EXTRA_INFO["salmon-index"].ph+'">' +
+        '<button class="browse-btn" onclick="openBrowser(\'inp-salmon-index\',\'dir\')">...</button>' +
+      '</div>';
+  } else {
+    div.innerHTML = '<label>STAR index directory</label>' +
+      '<div class="field-row">' +
+        '<input type="text" id="inp-star-index" placeholder="'+EXTRA_INFO["star-index"].ph+'">' +
+        '<button class="browse-btn" onclick="openBrowser(\'inp-star-index\',\'dir\')">...</button>' +
+      '</div>';
+  }
+}
+
+function updateMethylationMethod() {
+  const sel = document.getElementById("inp-meth-method");
+  const div = document.getElementById("meth-extra-fields");
+  if (!sel || !div) return;
+  const samplesField = document.getElementById("inp-samples");
+  const samplesRow   = samplesField && samplesField.closest(".field");
+  if (sel.value === "array") {
+    if (samplesRow) samplesRow.style.display = "none";
+    div.innerHTML =
+      '<div class="field full">' +
+        '<label>Beta matrix CSV — probes as rows, GSM accessions as columns (GEO supplementary format)</label>' +
+        '<div class="field-row">' +
+          '<input type="text" id="inp-betas" placeholder="/data/GSE59685_betas.csv">' +
+          '<button class="browse-btn" onclick="openBrowser(\'inp-betas\',\'file\')">...</button>' +
+        '</div>' +
+      '</div>' +
+      '<div class="field full">' +
+        '<label>Metadata CSV — must have geo_accession and disease.state columns</label>' +
+        '<div class="field-row">' +
+          '<input type="text" id="inp-metadata-csv" placeholder="/data/metadata.csv">' +
+          '<button class="browse-btn" onclick="openBrowser(\'inp-metadata-csv\',\'file\')">...</button>' +
+        '</div>' +
+      '</div>';
+  } else {
+    if (samplesRow) samplesRow.style.display = "";
+    div.innerHTML =
+      '<div class="field full">' +
+        '<label>Bismark genome directory</label>' +
+        '<div class="field-row">' +
+          '<input type="text" id="inp-bismark-genome" placeholder="'+EXTRA_INFO["bismark-genome"].ph+'">' +
+          '<button class="browse-btn" onclick="openBrowser(\'inp-bismark-genome\',\'dir\')">...</button>' +
+        '</div>' +
+      '</div>';
+  }
+}
+
+// ── GEO download ──────────────────────────────────────────────────────────
+
+function geoMsg(msg, color) {
+  const el = document.getElementById("geo-msg");
+  el.textContent = msg; el.style.color = color || "var(--red)";
+}
+
+async function fetchGSE() {
+  const inp = document.getElementById("inp-gse");
+  const gse = inp.value.trim().toUpperCase();
+  inp.value = gse;
+  geoMsg(""); document.getElementById("geo-results").style.display = "none";
+  if (!gse) { geoMsg("Enter a GSE accession."); return; }
+  const btn = document.getElementById("btn-fetch");
+  btn.disabled = true; btn.textContent = "Fetching…";
+  try {
+    const res = await fetch("/api/geo/"+gse);
+    const data = await res.json();
+    if (!res.ok) { geoMsg(data.detail || "Series not found."); return; }
+
+    document.getElementById("geo-series-info").textContent =
+      data.gse+" — "+data.title+" — "+data.organism+" — "+data.n_samples+" samples";
+
+    const tbody = document.getElementById("geo-tbody");
+    tbody.innerHTML = "";
+    for (const s of data.samples) {
+      const tr = document.createElement("tr");
+      tr.innerHTML =
+        '<td style="font-family:monospace;font-size:.72rem">'+s.gsm+'</td>'+
+        '<td>'+s.title+'</td>'+
+        '<td><select class="grp-sel" data-gsm="'+s.gsm+'">'+
+          '<option value="disease">disease</option>'+
+          '<option value="control">control</option>'+
+          '<option value="skip">skip</option>'+
+        '</select></td>'+
+        '<td class="srr-cell" id="srr-'+s.gsm+'"><span class="spin" style="font-size:.8rem">&#8635;</span></td>';
+      tbody.appendChild(tr);
+    }
+    document.getElementById("geo-results").style.display = "";
+    geoMsg("Loading SRR accessions…", "var(--dim)");
+
+    // fetch SRRs concurrently — server rate-limits NCBI calls internally
+    Promise.all(data.samples.map(function(s) {
+      return fetch("/api/geo/srr/"+s.gsm)
+        .then(function(r) { return r.json(); })
+        .then(function(d) {
+          const td = document.getElementById("srr-"+s.gsm);
+          if (!td) return;
+          if (d.srrs && d.srrs.length) {
+            td.textContent = d.srrs[0];
+            td.dataset.srr = d.srrs[0];
+          } else {
+            td.textContent = "not found"; td.className = "srr-err";
+          }
+        });
+    })).then(function() { geoMsg(""); });
+
+  } catch(e) {
+    geoMsg("Network error: "+e.message);
+  } finally {
+    btn.disabled = false; btn.textContent = "Fetch metadata";
+  }
+}
+
+async function startGeoDownload() {
+  document.getElementById("geo-dl-msg").textContent = "";
+  const outdir = document.getElementById("inp-geo-outdir").value.trim() || "data/";
+  const geoSamples = [];
+
+  for (const sel of document.querySelectorAll(".grp-sel")) {
+    if (sel.value === "skip") continue;
+    const gsm = sel.dataset.gsm;
+    const td  = document.getElementById("srr-"+gsm);
+    const srr = td && td.dataset && td.dataset.srr;
+    if (!srr) {
+      document.getElementById("geo-dl-msg").textContent =
+        "SRR not loaded for "+gsm+" yet — wait a moment and try again.";
+      return;
+    }
+    geoSamples.push({gsm:gsm, srr:srr, name:gsm, group:sel.value});
+  }
+
+  const disease = geoSamples.filter(function(s){return s.group==="disease";});
+  const control = geoSamples.filter(function(s){return s.group==="control";});
+  if (!disease.length || !control.length) {
+    document.getElementById("geo-dl-msg").textContent =
+      "Assign at least one disease and one control sample.";
+    return;
+  }
+
+  await _kickoffRun(
+    {track:"download_geo", outdir:outdir, geo_samples:geoSamples},
+    "Download Data",
+    geoSamples.length
+  );
+}
+
+// ── Pipeline run ──────────────────────────────────────────────────────────
+
+function err(msg) {
+  const el = document.getElementById("form-msg"); if (el) el.textContent = msg;
+}
+
+async function startRun() {
+  err("");
+  if (!track) { err("Select a track first."); return; }
+  const outdir  = document.getElementById("inp-outdir").value.trim() || "results/";
+  const threads = parseInt(document.getElementById("inp-threads").value) || 4;
+  const explain = document.getElementById("inp-explain").checked;
+  const body = {track:track, outdir:outdir, threads:threads, explain:explain};
+
+  if (TRACKS[track].isMethylation) {
+    const method = (document.getElementById("inp-meth-method") || {value:"wgbs"}).value;
+    body.method = method;
+    if (method === "array") {
+      const betas   = (document.getElementById("inp-betas")        || {value:""}).value.trim();
+      const metaCsv = (document.getElementById("inp-metadata-csv") || {value:""}).value.trim();
+      if (!betas)   { err("Beta matrix CSV path is required."); return; }
+      if (!metaCsv) { err("Metadata CSV path is required."); return; }
+      body.betas = betas;
+      body.metadata_csv = metaCsv;
+      await _kickoffRun(body, TRACKS[track].label+" (array)", 1);
+    } else {
+      const samples = document.getElementById("inp-samples").value.trim();
+      const bg      = (document.getElementById("inp-bismark-genome") || {value:""}).value.trim();
+      if (!samples) { err("Samples CSV path is required."); return; }
+      if (!bg)      { err("Bismark genome directory is required."); return; }
+      body.samples = samples;
+      body.bismark_genome = bg;
+      await _kickoffRun(body, TRACKS[track].label+" (WGBS)", 4);
+    }
+    return;
+  }
+
+  const samples = document.getElementById("inp-samples").value.trim();
+  if (!samples) { err("Samples CSV path is required."); return; }
+  body.samples = samples;
+
+  if (TRACKS[track].isRnaseq) {
+    const aligner = (document.getElementById("inp-aligner") || {}).value || "salmon";
+    body.aligner = aligner;
+    const idxId = aligner==="salmon" ? "inp-salmon-index" : "inp-star-index";
+    const idxEl = document.getElementById(idxId);
+    const idx   = idxEl ? idxEl.value.trim() : "";
+    if (!idx) { err((aligner==="salmon"?"Salmon":"STAR")+" index directory is required."); return; }
+    body[aligner==="salmon" ? "salmon_index" : "star_index"] = idx;
+  } else {
+    for (const k of (TRACKS[track].extra || [])) {
+      const el = document.getElementById("inp-"+k);
+      const v  = el ? el.value.trim() : "";
+      if (!v) { err(EXTRA_INFO[k].label+" is required."); return; }
+      body[k.split("-").join("_")] = v;
+    }
+  }
+
+  await _kickoffRun(body, TRACKS[track].label, TRACKS[track].nsteps);
+}
+
+async function _kickoffRun(body, label, nsteps) {
+  _runNsteps = nsteps;
+  document.getElementById("setup-panel").style.display = "none";
+  document.getElementById("log-panel").style.display = "flex";
+  document.getElementById("log-title").textContent = label || "";
+  document.getElementById("log").innerHTML = "";
+  document.getElementById("log-status").innerHTML = '<span class="spin">&#8635;</span>&nbsp;Running&hellip;';
+  document.getElementById("btn-stop").style.display = "";
+  document.getElementById("btn-newrun").style.display = "none";
+
+  stepIdx = 0;
+  const sr = document.getElementById("steps-row");
+  sr.innerHTML = "";
+  for (let i = 0; i < nsteps; i++) {
+    const d = document.createElement("div");
+    d.className = "dot"+(i===0?" active":""); d.id = "dot-"+i;
+    sr.appendChild(d);
+  }
+
+  const res = await fetch("/api/run", {
+    method:"POST", headers:{"Content-Type":"application/json"},
+    body: JSON.stringify(body)
+  });
+  const data = await res.json();
+  runId = data.run_id;
+
+  sse = new EventSource("/api/stream/"+runId);
+  sse.onmessage = function(e) {
+    const d = JSON.parse(e.data);
+    if (d.done) {
+      sse.close(); runId = null;
+      const ok = d.exit_code === 0;
+      document.getElementById("log-status").innerHTML = ok
+        ? '<span style="color:var(--green)">✓ Complete</span>'
+        : d.status==="cancelled"
+          ? '<span style="color:var(--yellow)">Cancelled</span>'
+          : '<span style="color:var(--red)">✗ Failed (exit '+d.exit_code+')</span>';
+      document.getElementById("btn-stop").style.display  = "none";
+      document.getElementById("btn-newrun").style.display = "";
+      if (ok) {
+        document.querySelectorAll(".dot").forEach(function(dot) {
+          dot.classList.remove("active"); dot.classList.add("done");
+        });
+      } else {
+        document.querySelectorAll(".dot.active").forEach(function(dot) {
+          dot.classList.remove("active"); dot.classList.add("err");
+        });
+      }
+      return;
+    }
+    appendLine(d.text, d.cls);
+    if (d.cls==="step") {
+      const cur = document.getElementById("dot-"+stepIdx);
+      if (cur) { cur.classList.remove("active"); cur.classList.add("done"); }
+      stepIdx = Math.min(stepIdx+1, _runNsteps-1);
+      const nxt = document.getElementById("dot-"+stepIdx);
+      if (nxt) nxt.classList.add("active");
+    }
+  };
+  sse.onerror = function() {
+    if (runId) {
+      appendLine("⚠ Connection lost. Check your outdir for results.", "error");
+      document.getElementById("log-status").innerHTML =
+        '<span style="color:var(--yellow)">Connection lost</span>';
+      document.getElementById("btn-stop").style.display  = "none";
+      document.getElementById("btn-newrun").style.display = "";
+    }
+    sse.close(); runId = null;
+  };
+}
+
+// ── File browser ─────────────────────────────────────────────────────────
+
+let _browserTarget = null;
+let _browserType   = "any";
+
+async function openBrowser(inputId, type) {
+  _browserTarget = inputId;
+  _browserType   = type;
+  const el = document.getElementById(inputId);
+  const start = el ? el.value.trim() : "";
+  document.getElementById("browser-bar").style.display = type === "file" ? "none" : "";
+  document.getElementById("browser-modal").classList.add("open");
+  await navigateBrowser(start || "~");
+}
+
+function closeBrowser() {
+  document.getElementById("browser-modal").classList.remove("open");
+}
+
+async function navigateBrowser(path) {
+  try {
+    const res  = await fetch("/api/browse?path="+encodeURIComponent(path));
+    const data = await res.json();
+    document.getElementById("browser-path").textContent = data.path;
+    document.getElementById("browser-path").dataset.path = data.path;
+
+    const list = document.getElementById("browser-list");
+    list.innerHTML = "";
+
+    if (data.parent) {
+      const row = document.createElement("div");
+      row.className = "browser-row";
+      row.innerHTML = '<span class="browser-icon">&#128193;</span><span style="color:var(--dim)">..</span>';
+      row.onclick = function() { navigateBrowser(data.parent); };
+      list.appendChild(row);
+    }
+
+    for (const e of data.entries) {
+      if (!e.is_dir && _browserType === "dir") continue;
+      const row = document.createElement("div");
+      row.className = "browser-row";
+      const icon = e.is_dir ? "&#128193;" : "&#128196;";
+      row.innerHTML = '<span class="browser-icon">'+icon+'</span><span>'+e.name+'</span>';
+      if (e.is_dir) {
+        row.onclick = function() { navigateBrowser(e.path); };
+      } else {
+        row.onclick = function() { pickBrowserItem(e.path); };
+      }
+      list.appendChild(row);
+    }
+  } catch(ex) {
+    document.getElementById("browser-list").innerHTML =
+      '<div style="padding:.75rem;color:var(--red);font-size:.75rem">Error: '+ex.message+'</div>';
+  }
+}
+
+function selectBrowserDir() {
+  const path = document.getElementById("browser-path").dataset.path;
+  if (path && _browserTarget) {
+    const el = document.getElementById(_browserTarget);
+    if (el) el.value = path;
+  }
+  closeBrowser();
+}
+
+function pickBrowserItem(path) {
+  if (_browserTarget) {
+    const el = document.getElementById(_browserTarget);
+    if (el) el.value = path;
+  }
+  closeBrowser();
+}
+
+function appendLine(text, cls) {
+  const log = document.getElementById("log");
+  const div = document.createElement("div");
+  div.className = "ll "+(cls||"out"); div.textContent = text;
+  log.appendChild(div); log.scrollTop = log.scrollHeight;
+}
+
+async function stopRun() {
+  if (!runId) return;
+  await fetch("/api/cancel/"+runId, {method:"POST"});
+  if (sse) sse.close();
+  appendLine("Run cancelled.", "error");
+  document.getElementById("log-status").innerHTML =
+    '<span style="color:var(--yellow)">Cancelled</span>';
+  document.getElementById("btn-stop").style.display  = "none";
+  document.getElementById("btn-newrun").style.display = "";
+  runId = null;
+}
+
+function newRun() {
+  document.getElementById("log-panel").style.display = "none";
+  document.getElementById("setup-panel").style.display = "";
+}
+
+selectTrack("rnaseq");
+</script>
+</body>
+</html>
+"""

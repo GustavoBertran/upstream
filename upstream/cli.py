@@ -27,7 +27,7 @@ from rich.console import Console
 from rich.markdown import Markdown
 from rich.panel import Panel
 
-from . import checkpoints, obama, runner
+from . import checkpoints, downloader, obama, runner
 
 app = typer.Typer(
     name="htsprep",
@@ -91,7 +91,7 @@ def _check(ok: bool, msg: str) -> None:
 
 def _explain(content_file: str) -> None:
     try:
-        pkg = importlib.resources.files("htsprep") / "content" / content_file
+        pkg = importlib.resources.files("upstream") / "content" / content_file
         text = pkg.read_text(encoding="utf-8")
         console.print(Panel(Markdown(text), border_style="dim blue", padding=(1, 2)))
     except Exception:
@@ -144,22 +144,47 @@ def qc(
 @app.command()
 def rnaseq(
     samples: SamplesOpt,
-    star_index: Annotated[Path, typer.Option("--star-index",   help="Pre-built STAR genome index directory")],
-    salmon_index: Annotated[Path, typer.Option("--salmon-index", help="Pre-built Salmon index directory")],
     outdir: OutdirOpt,
+    aligner: Annotated[str, typer.Option(
+        "--aligner",
+        help="'salmon' (alignment-free, default) or 'star' (genome alignment + gene counts).",
+    )] = "salmon",
+    salmon_index: Annotated[Optional[Path], typer.Option(
+        "--salmon-index", help="Pre-built Salmon index directory (required for --aligner salmon).",
+    )] = None,
+    star_index: Annotated[Optional[Path], typer.Option(
+        "--star-index", help="Pre-built STAR genome index directory (required for --aligner star).",
+    )] = None,
     threads: ThreadsOpt = 4,
     explain: ExplainOpt = True,
 ) -> None:
-    """RNA-seq: QC → trim (fastp) → align (STAR) → quantify (Salmon) → OBAMA matrix."""
+    """RNA-seq: trim (fastp) → align/quantify (STAR or Salmon) → OBAMA matrix.
+
+    Use --aligner salmon (default) for alignment-free TPM quantification via Salmon.
+    Use --aligner star for genome alignment with STAR; gene counts are produced via
+    STAR's built-in --quantMode GeneCounts (no separate quantification tool needed).
+    """
+    if aligner not in ("salmon", "star"):
+        _die("--aligner must be 'salmon' or 'star'.")
+    if aligner == "salmon" and salmon_index is None:
+        _die("--salmon-index is required when --aligner salmon.")
+    if aligner == "star" and star_index is None:
+        _die("--star-index is required when --aligner star.")
+
     sample_list = _read_samplesheet(samples)
-    _require_dir(star_index,   "STAR index")
-    _require_dir(salmon_index, "Salmon index")
+    if aligner == "salmon":
+        _require_dir(salmon_index, "Salmon index")
+    else:
+        _require_dir(star_index, "STAR index")
     outdir.mkdir(parents=True, exist_ok=True)
 
-    TOTAL = 4
-    console.print(f"\n[bold]RNA-seq pipeline[/bold] — {len(sample_list)} sample(s) → {outdir}\n")
+    TOTAL = 3
+    console.print(
+        f"\n[bold]RNA-seq pipeline[/bold] ({aligner}) — "
+        f"{len(sample_list)} sample(s) → {outdir}\n"
+    )
 
-    salmon_dirs: list[tuple[str, str, Path]] = []
+    result_dirs: list[tuple[str, str, Path]] = []
 
     for s in sample_list:
         name, group = s["name"], s["group"]
@@ -190,56 +215,62 @@ def rnaseq(
             _die(f"fastp failed for sample '{name}'.")
         _check(*checkpoints.check_fastp_trim(trim_dir / f"{name}_fastp.json"))
 
-        # 2 — Align
-        runner.step_header("Align — STAR", 2, TOTAL)
-        if explain:
-            _explain("rnaseq_align.md")
-        aln_dir = sdir / "aligned"
-        aln_dir.mkdir(exist_ok=True)
-        rc = runner.run([
-            "STAR",
-            "--runThreadN",       str(threads),
-            "--genomeDir",        str(star_index),
-            "--readFilesIn",      str(trim_dir / f"{name}_R1.fastq.gz"),
-                                  str(trim_dir / f"{name}_R2.fastq.gz"),
-            "--readFilesCommand", "zcat",
-            "--outSAMtype",       "BAM", "SortedByCoordinate",
-            "--outSAMattributes", "NH", "HI", "AS", "NM",
-            "--outFileNamePrefix", str(aln_dir / f"{name}_"),
-            "--runRNGseed",       "42",
-        ])
-        if rc != 0:
-            _die(f"STAR alignment failed for sample '{name}'.")
-        _check(*checkpoints.check_star_bam(
-            aln_dir / f"{name}_Aligned.sortedByCoord.out.bam",
-            aln_dir / f"{name}_Log.final.out",
-        ))
+        if aligner == "salmon":
+            # 2 — Salmon quantification (alignment-free)
+            runner.step_header("Quantify — Salmon", 2, TOTAL)
+            if explain:
+                _explain("rnaseq_quantify.md")
+            quant_dir = sdir / "salmon"
+            rc = runner.run([
+                "salmon", "quant",
+                "--index",    str(salmon_index),
+                "--libType",  "A",
+                "--mates1",   str(trim_dir / f"{name}_R1.fastq.gz"),
+                "--mates2",   str(trim_dir / f"{name}_R2.fastq.gz"),
+                "--threads",  str(threads),
+                "--output",   str(quant_dir),
+                "--validateMappings",
+            ])
+            if rc != 0:
+                _die(f"Salmon quantification failed for sample '{name}'.")
+            _check(*checkpoints.check_salmon_sf(quant_dir / "quant.sf"))
+            result_dirs.append((name, group, quant_dir))
 
-        # 3 — Quantify
-        runner.step_header("Quantify — Salmon", 3, TOTAL)
-        if explain:
-            _explain("rnaseq_quantify.md")
-        quant_dir = sdir / "salmon"
-        rc = runner.run([
-            "salmon", "quant",
-            "--index",    str(salmon_index),
-            "--libType",  "A",
-            "--mates1",   str(trim_dir / f"{name}_R1.fastq.gz"),
-            "--mates2",   str(trim_dir / f"{name}_R2.fastq.gz"),
-            "--threads",  str(threads),
-            "--output",   str(quant_dir),
-            "--validateMappings",
-        ])
-        if rc != 0:
-            _die(f"Salmon quantification failed for sample '{name}'.")
-        _check(*checkpoints.check_salmon_sf(quant_dir / "quant.sf"))
+        else:
+            # 2 — STAR alignment with built-in gene counts
+            runner.step_header("Align — STAR", 2, TOTAL)
+            if explain:
+                _explain("rnaseq_align.md")
+            aln_dir = sdir / "aligned"
+            aln_dir.mkdir(exist_ok=True)
+            rc = runner.run([
+                "STAR",
+                "--runThreadN",       str(threads),
+                "--genomeDir",        str(star_index),
+                "--readFilesIn",      str(trim_dir / f"{name}_R1.fastq.gz"),
+                                      str(trim_dir / f"{name}_R2.fastq.gz"),
+                "--readFilesCommand", "zcat",
+                "--outSAMtype",       "BAM", "SortedByCoordinate",
+                "--outSAMattributes", "NH", "HI", "AS", "NM",
+                "--outFileNamePrefix", str(aln_dir / f"{name}_"),
+                "--quantMode",        "GeneCounts",
+                "--runRNGseed",       "42",
+            ])
+            if rc != 0:
+                _die(f"STAR alignment failed for sample '{name}'.")
+            _check(*checkpoints.check_star_bam(
+                aln_dir / f"{name}_Aligned.sortedByCoord.out.bam",
+                aln_dir / f"{name}_Log.final.out",
+            ))
+            result_dirs.append((name, group, aln_dir / f"{name}_ReadsPerGene.out.tab"))
 
-        salmon_dirs.append((name, group, quant_dir))
-
-    # 4 — OBAMA matrix
-    runner.step_header("OBAMA matrix", 4, TOTAL)
+    # 3 — OBAMA matrix
+    runner.step_header("OBAMA matrix", 3, TOTAL)
     matrix_path = outdir / "obama_matrix.csv"
-    obama.build_rnaseq(salmon_dirs, matrix_path)
+    if aligner == "salmon":
+        obama.build_rnaseq(result_dirs, matrix_path)
+    else:
+        obama.build_rnaseq_star(result_dirs, matrix_path)
     _check(*checkpoints.check_obama_format(matrix_path))
 
     console.print(f"\n[bold green]Done.[/bold green] OBAMA matrix → {matrix_path}")
@@ -376,17 +407,58 @@ def atacseq(
 
 @app.command()
 def methylation(
-    samples: SamplesOpt,
-    bismark_genome: Annotated[Path, typer.Option("--bismark-genome",
-                              help="Bismark-prepared genome directory (from bismark_genome_preparation)")],
     outdir: OutdirOpt,
+    method: Annotated[str, typer.Option("--method",
+                      help="wgbs (Bismark pipeline, default) or array (Illumina 450K/EPIC from GEO).")] = "wgbs",
+    samples: Annotated[Optional[Path], typer.Option("--samples",
+                       help="Samplesheet CSV (for --method wgbs).")] = None,
+    bismark_genome: Annotated[Optional[Path], typer.Option("--bismark-genome",
+                              help="Bismark genome directory (for --method wgbs).")] = None,
+    betas: Annotated[Optional[Path], typer.Option("--betas",
+                    help="Beta matrix CSV from GEO (for --method array).")] = None,
+    metadata: Annotated[Optional[Path], typer.Option("--metadata",
+                        help="Metadata CSV with geo_accession and disease.state (for --method array).")] = None,
     threads: ThreadsOpt = 4,
     explain: ExplainOpt = True,
 ) -> None:
-    """Methylation: QC → trim (fastp) → align (Bismark) → extract → OBAMA matrix."""
+    """Methylation: WGBS (Bismark pipeline) or Illumina array (450K/EPIC beta matrix from GEO)."""
+    if method not in ("wgbs", "array"):
+        _die(f"Unknown --method: {method!r}. Use 'wgbs' or 'array'.")
+
+    outdir.mkdir(parents=True, exist_ok=True)
+
+    if method == "array":
+        if not betas:
+            _die("--betas is required for --method array.")
+        if not metadata:
+            _die("--metadata is required for --method array.")
+        if not betas.exists():
+            _die(f"Beta matrix not found: {betas}")
+        if not metadata.exists():
+            _die(f"Metadata file not found: {metadata}")
+
+        TOTAL = 1
+        console.print(f"\n[bold]Methylation (array) pipeline[/bold] — building OBAMA matrix\n")
+        runner.step_header("OBAMA matrix — merge beta values with metadata", 1, TOTAL)
+        if explain:
+            _explain("methylation_array.md")
+
+        matrix_path = outdir / "obama_matrix.csv"
+        try:
+            obama.build_methylation_array(betas, metadata, matrix_path)
+        except ValueError as e:
+            _die(str(e))
+        _check(*checkpoints.check_obama_format(matrix_path))
+        console.print(f"\n[bold green]Done.[/bold green] OBAMA matrix → {matrix_path}")
+        return
+
+    # ── WGBS path ──
+    if not samples:
+        _die("--samples is required for --method wgbs.")
+    if not bismark_genome:
+        _die("--bismark-genome is required for --method wgbs.")
     sample_list = _read_samplesheet(samples)
     _require_dir(bismark_genome, "Bismark genome directory")
-    outdir.mkdir(parents=True, exist_ok=True)
 
     TOTAL = 4
     console.print(f"\n[bold]Methylation pipeline[/bold] — {len(sample_list)} sample(s) → {outdir}\n")
@@ -480,3 +552,81 @@ def methylation(
     _check(*checkpoints.check_obama_format(matrix_path))
 
     console.print(f"\n[bold green]Done.[/bold green] OBAMA matrix → {matrix_path}")
+
+
+# ── Download ───────────────────────────────────────────────────────────────
+
+
+@app.command()
+def download(
+    track: Annotated[Optional[str], typer.Option(
+        "--track",
+        help="Track to set up: rnaseq, atacseq, methylation, qc. Omit to list all.",
+    )] = None,
+    outdir: Annotated[Path, typer.Option(
+        "--outdir",
+        help="Directory to write samples.csv (and where to look for locally downloaded files).",
+    )] = Path("data"),
+    shared_data: Annotated[Path, typer.Option(
+        "--shared-data",
+        envvar="UPSTREAM_SHARED_DATA",
+        help="Path to the server's shared FASTQ directory (default: /data/upstream/shared).",
+    )] = Path("/data/upstream/shared"),
+    instructions: Annotated[bool, typer.Option(
+        "--instructions",
+        help="Show manual download instructions instead of writing samples.csv.",
+    )] = False,
+) -> None:
+    """Locate example data and write a samples.csv ready for the pipeline.
+
+    Checks the shared server data directory first (set up by the course admin
+    via scripts/prepare_sample_data.sh), then looks in --outdir for files the
+    user downloaded themselves.  If neither is found, prints instructions for
+    obtaining the data independently.
+
+    Set UPSTREAM_SHARED_DATA to override the default shared-data path.
+    """
+    if track is None:
+        downloader.print_catalog()
+        return
+
+    downloader.locate_or_download(
+        track=track,
+        outdir=outdir,
+        shared_data=shared_data,
+        instructions_only=instructions,
+    )
+
+
+# ── Serve ─────────────────────────────────────────────────────────────────
+
+
+@app.command()
+def serve(
+    port: Annotated[int, typer.Option("--port", help="Port to listen on.")] = 8421,
+    host: Annotated[str, typer.Option("--host", help="Host to bind (127.0.0.1 = localhost only).")] = "127.0.0.1",
+) -> None:
+    """Launch the web UI in a browser-accessible local server.
+
+    Runs on localhost by default — access it at http://localhost:<port>.
+    Over SSH, forward the port first:
+
+      ssh -L <port>:localhost:<port> your_username@server
+
+    Then open http://localhost:<port> in your local browser.
+    """
+    try:
+        import uvicorn
+    except ImportError:
+        _die("uvicorn is not installed. Run: pip install uvicorn")
+
+    from .server import app as web_app
+
+    url = f"http://{host}:{port}"
+    console.print(f"\n[bold]upstream web UI[/bold] → [bold cyan]{url}[/bold cyan]")
+    if host == "127.0.0.1":
+        console.print(
+            f"[dim]SSH tunnel (if on a remote server):[/dim]\n"
+            f"  [dim]ssh -L {port}:localhost:{port} your_username@server[/dim]\n"
+        )
+    uvicorn.run(web_app, host=host, port=port, log_level="warning")
