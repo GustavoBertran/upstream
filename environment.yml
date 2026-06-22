@@ -20,6 +20,7 @@ dependencies:
   # Methylation
   - bismark=0.24.2
   # Shared utilities
+  - sra-tools=3.1   # prefetch + fasterq-dump (GEO/SRA download)
   - seqtk=1.4
   - pip
   - pip:
