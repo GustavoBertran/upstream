@@ -770,7 +770,7 @@ input:checked+.slider::before{transform:translateX(14px)}
       <div class="field">
         <label>Output directory</label>
         <div class="field-row">
-          <input id="inp-outdir" type="text" value="results/">
+          <input id="inp-outdir" type="text" placeholder="results/">
           <button class="browse-btn" onclick="openBrowser('inp-outdir','dir')">...</button>
         </div>
       </div>
@@ -1041,6 +1041,7 @@ function selectTrack(id) {
       _wireBrowse(ef);
     }
   }
+  if (typeof _restoreInputs === "function") _restoreInputs();
 }
 
 function _wireBrowse(el) {
@@ -1068,6 +1069,7 @@ function updateAlignerField() {
   }
   _wireBrowse(div);
   updateFormatField();   // GTF field is Salmon-only; refresh when aligner changes
+  if (typeof _restoreInputs === "function") _restoreInputs();
 }
 
 function updateFormatField() {
@@ -1126,6 +1128,7 @@ function updateMethylationMethod() {
       '</div>';
   }
   _wireBrowse(div);
+  if (typeof _restoreInputs === "function") _restoreInputs();
 }
 
 // ── GEO download ──────────────────────────────────────────────────────────
@@ -1935,7 +1938,25 @@ document.addEventListener("click", function(){
   document.querySelectorAll(".facet-popup.open").forEach(function(p){ p.classList.remove("open"); });
 });
 
+// Remember last-used paths across sessions (localStorage). Only empty fields are
+// restored, so a value the user typed or the "from folder" builder set is never
+// clobbered when fields are rebuilt.
+function _restoreInputs() {
+  document.querySelectorAll('#setup-panel input[type=text]').forEach(function(el){
+    if (el.id && !el.value) {
+      try { var v = localStorage.getItem("us:" + el.id); if (v) el.value = v; } catch (e) {}
+    }
+  });
+}
+document.addEventListener("change", function(e){
+  var t = e.target;
+  if (t && t.id && t.id.indexOf("inp-") === 0 && t.type === "text") {
+    try { localStorage.setItem("us:" + t.id, t.value); } catch (e2) {}
+  }
+});
+
 selectTrack("rnaseq");
+_restoreInputs();
 </script>
 </body>
 </html>
