@@ -534,12 +534,17 @@ def methylation(
         ])
         if rc != 0:
             _die(f"Bismark alignment failed for sample '{name}'.")
-        if paired:
-            bam = bismark_dir / f"{name}_bismark_bt2_pe.bam"
-            report = bismark_dir / f"{name}_bismark_bt2_PE_report.txt"
-        else:
-            bam = bismark_dir / f"{name}_bismark_bt2.bam"
-            report = bismark_dir / f"{name}_bismark_bt2_SE_report.txt"
+        # Resolve Bismark's output by globbing rather than hardcoding: the exact
+        # name depends on the Bismark version and whether --basename strips the
+        # "_bismark_bt2" tag. PE emits *_pe.bam/*_PE_report.txt; SE *.bam/*_SE_report.txt.
+        bam_glob = "*_pe.bam" if paired else "*.bam"
+        rep_glob = "*_PE_report.txt" if paired else "*_SE_report.txt"
+        bams = sorted(bismark_dir.glob(f"{name}{bam_glob}")) or sorted(bismark_dir.glob(bam_glob))
+        reps = sorted(bismark_dir.glob(f"{name}*{rep_glob[1:]}")) or sorted(bismark_dir.glob(rep_glob))
+        if not bams:
+            _die(f"Bismark BAM not found in {bismark_dir} for sample '{name}'.")
+        bam = bams[0]
+        report = reps[0] if reps else None
         _check(*checkpoints.check_bismark_bam(bam, report))
 
         # 3 — Methylation extraction
