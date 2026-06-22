@@ -50,6 +50,10 @@ class RunRequest(BaseModel):
     explain: bool = True
     # rnaseq aligner choice
     aligner: Optional[str] = None
+    # rnaseq output format + gene-level aggregation
+    output_format: Optional[str] = None   # obama | matrix | both
+    gtf: Optional[str] = None
+    tx2gene: Optional[str] = None
     # legacy catalog download
     data_track: Optional[str] = None
     # geo download
@@ -156,6 +160,13 @@ def _build_cmd(req: RunRequest) -> list[str]:
         cmd += ["--bowtie2-index", req.bowtie2_index]
     if req.bismark_genome:
         cmd += ["--bismark-genome", req.bismark_genome]
+    if req.track == "rnaseq":
+        if req.output_format:
+            cmd += ["--format", req.output_format]
+        if req.gtf:
+            cmd += ["--gtf", req.gtf]
+        if req.tx2gene:
+            cmd += ["--tx2gene", req.tx2gene]
     return cmd
 
 
@@ -834,7 +845,7 @@ input:checked+.slider::before{transform:translateX(14px)}
 
 <script>
 const TRACKS = {
-  rnaseq:      {label:"RNA-seq",      desc:"fastp → STAR or Salmon → OBAMA matrix",      nsteps:3, isRnaseq:true},
+  rnaseq:      {label:"RNA-seq",      desc:"fastp → STAR or Salmon → counts matrix (OBAMA / DESeq2)", nsteps:3, isRnaseq:true},
   atacseq:     {label:"ATAC-seq",     desc:"fastp → Bowtie2 → filter → MACS2 → matrix",  nsteps:5, extra:["bowtie2-index"]},
   methylation: {label:"Methylation",  desc:"WGBS (Bismark) or 450K/EPIC array (GEO beta matrix)",nsteps:4, isMethylation:true},
   qc:          {label:"QC",           desc:"FastQC + MultiQC",                                    nsteps:2, extra:[]},
@@ -889,8 +900,18 @@ function selectTrack(id) {
             '<option value="star">STAR — genome alignment + gene counts</option>' +
           '</select>' +
         '</div>' +
-        '<div class="field full" id="aligner-idx-field"></div>';
+        '<div class="field full" id="aligner-idx-field"></div>' +
+        '<div class="field full">' +
+          '<label>Output format</label>' +
+          '<select id="inp-format" onchange="updateFormatField()">' +
+            '<option value="obama">OBAMA matrix (samples × features)</option>' +
+            '<option value="matrix">DESeq2 / edgeR / limma — counts matrix + coldata</option>' +
+            '<option value="both">Both</option>' +
+          '</select>' +
+        '</div>' +
+        '<div class="field full" id="gtf-field"></div>';
       updateAlignerField();
+      updateFormatField();
     } else if (isMethylation) {
       ef.innerHTML =
         '<div class="field full">' +
@@ -940,6 +961,28 @@ function updateAlignerField() {
       '</div>';
   }
   _wireBrowse(div);
+  updateFormatField();   // GTF field is Salmon-only; refresh when aligner changes
+}
+
+function updateFormatField() {
+  const div = document.getElementById("gtf-field");
+  if (!div) return;
+  const aligner = (document.getElementById("inp-aligner") || {}).value || "salmon";
+  if (aligner === "salmon") {
+    div.style.display = "";
+    div.innerHTML =
+      '<label>GTF for gene-level counts (optional)</label>' +
+      '<div class="field-row">' +
+        '<input type="text" id="inp-gtf" placeholder="/path/gencode.annotation.gtf.gz">' +
+        '<button class="browse-btn" data-inp="inp-gtf" data-btype="file">...</button>' +
+      '</div>' +
+      '<div class="hint">Aggregates Salmon transcripts → genes (tximport-style). ' +
+        'Without it, Salmon counts stay transcript-level. STAR is already gene-level.</div>';
+    _wireBrowse(div);
+  } else {
+    div.style.display = "none";
+    div.innerHTML = "";   // STAR output is already gene-level; no GTF needed
+  }
 }
 
 function updateMethylationMethod() {
@@ -1474,6 +1517,11 @@ async function startRun() {
     const idx   = idxEl ? idxEl.value.trim() : "";
     if (!idx) { err((aligner==="salmon"?"Salmon":"STAR")+" index directory is required."); return; }
     body[aligner==="salmon" ? "salmon_index" : "star_index"] = idx;
+    body.output_format = (document.getElementById("inp-format") || {value:"obama"}).value;
+    if (aligner === "salmon") {
+      const gtf = (document.getElementById("inp-gtf") || {value:""}).value.trim();
+      if (gtf) body.gtf = gtf;
+    }
   } else {
     for (const k of (TRACKS[track].extra || [])) {
       const el = document.getElementById("inp-"+k);

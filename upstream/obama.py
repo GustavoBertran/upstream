@@ -1,37 +1,196 @@
-"""Build OBAMA-compatible output matrices from pipeline results.
+"""Build downstream-analysis matrices from pipeline results.
 
-OBAMA requires:
+Two output layouts are supported (see write_rnaseq_outputs):
+
+OBAMA format (default) — one CSV, samples as rows:
   - First column:  geo_accession  (sample identifier)
   - Second column: disease.state  (must be exactly 'disease' or 'control')
-  - Remaining columns: one per feature (transcript, peak, or CpG position)
+  - Remaining columns: one per feature (gene, peak, or CpG position)
+  The labels 'disease'/'control' are hardcoded expectations in OBAMA's comparison
+  code; do not rename them.
 
-The labels 'disease' and 'control' are hardcoded expectations in OBAMA's comparison
-code. Do not rename them even when the experiment has no actual disease/control
-distinction — OBAMA will silently fail to find the groups otherwise.
+Matrix format (for DESeq2 / edgeR / limma-voom) — two files, features as rows:
+  - counts_matrix.csv: first column = feature id, one column per sample
+  - coldata.csv:       sample id + condition (disease/control)
+  R tools read these directly; see content/rnaseq_export_formats.md.
+
+RNA-seq values are RAW COUNTS (what OBAMA expects): Salmon NumReads (optionally
+aggregated transcript -> gene via a tx2gene map) and STAR ReadsPerGene counts.
 """
 
 import csv
+import gzip
+import re
 from pathlib import Path
+from typing import Optional
+
+
+# ── tx2gene ────────────────────────────────────────────────────────────────
+
+
+def _open_text(path: Path):
+    """Open a text file, transparently handling gzip (.gz)."""
+    return gzip.open(path, "rt") if str(path).endswith(".gz") else open(path)
+
+
+def load_tx2gene(
+    gtf_path: Optional[Path] = None,
+    tx2gene_path: Optional[Path] = None,
+) -> Optional[dict[str, str]]:
+    """Return a {transcript_id: gene} map, or None if no source is given.
+
+    A 2-column tx2gene CSV (transcript_id, gene) takes priority. Otherwise a GTF
+    is parsed: each 'transcript' feature maps its transcript_id to gene_name
+    (falling back to gene_id). GENCODE GTFs may be gzipped.
+    """
+    if tx2gene_path:
+        m: dict[str, str] = {}
+        with _open_text(tx2gene_path) as f:
+            for row in csv.reader(f):
+                if len(row) < 2:
+                    continue
+                tx, gene = row[0].strip(), row[1].strip()
+                if tx.lower() in ("transcript_id", "tx", "name", "target_id"):
+                    continue  # header
+                if tx:
+                    m[tx] = gene
+        return m or None
+
+    if gtf_path:
+        m = {}
+        tx_re = re.compile(r'transcript_id "([^"]+)"')
+        gn_re = re.compile(r'gene_name "([^"]+)"')
+        gid_re = re.compile(r'gene_id "([^"]+)"')
+        with _open_text(gtf_path) as f:
+            for line in f:
+                if line.startswith("#"):
+                    continue
+                parts = line.split("\t")
+                if len(parts) < 9 or parts[2] != "transcript":
+                    continue
+                tx = tx_re.search(parts[8])
+                if not tx:
+                    continue
+                gene = gn_re.search(parts[8]) or gid_re.search(parts[8])
+                if gene:
+                    m[tx.group(1)] = gene.group(1)
+        return m or None
+
+    return None
+
+
+# ── per-sample count readers ─────────────────────────────────────────────────
+
+
+def _read_salmon_counts(quant_dir: Path, tx2gene: Optional[dict[str, str]]) -> dict[str, float]:
+    """Read Salmon NumReads (estimated counts); aggregate to gene if tx2gene given."""
+    counts: dict[str, float] = {}
+    with (quant_dir / "quant.sf").open() as f:
+        for row in csv.DictReader(f, delimiter="\t"):
+            n = float(row["NumReads"])
+            if tx2gene:
+                tx = row["Name"]
+                gene = tx2gene.get(tx) or tx2gene.get(tx.split(".")[0])  # version fallback
+                if gene is None:
+                    gene = tx  # unmapped transcript: keep its own id rather than drop reads
+                counts[gene] = counts.get(gene, 0.0) + n
+            else:
+                counts[row["Name"]] = n
+    return counts
+
+
+def _read_star_counts(tab_path: Path) -> dict[str, float]:
+    """Read STAR ReadsPerGene.out.tab unstranded counts (column 1), gene-level."""
+    counts: dict[str, float] = {}
+    for line in tab_path.read_text().splitlines():
+        if line.startswith("N_"):  # skip STAR summary rows
+            continue
+        parts = line.split("\t")
+        if len(parts) < 2:
+            continue
+        counts[parts[0]] = float(parts[1])
+    return counts
+
+
+def _collect_rnaseq_counts(
+    samples: list[tuple[str, str, Path]],
+    source: str,
+    tx2gene: Optional[dict[str, str]],
+) -> tuple[list[str], dict[str, dict[str, float]]]:
+    """Return (ordered feature list from the first sample, {sample: {feature: count}})."""
+    data: dict[str, dict[str, float]] = {}
+    features: list[str] = []
+    for i, (name, _group, path) in enumerate(samples):
+        counts = _read_salmon_counts(path, tx2gene) if source == "salmon" else _read_star_counts(path)
+        data[name] = counts
+        if i == 0:
+            features = list(counts.keys())  # dict preserves insertion order
+    return features, data
+
+
+def write_rnaseq_outputs(
+    samples: list[tuple[str, str, Path]],
+    outdir: Path,
+    fmt: str,
+    source: str,
+    tx2gene: Optional[dict[str, str]] = None,
+) -> list[Path]:
+    """Write RNA-seq results in the requested format(s); return the files written.
+
+    fmt: 'obama' (default), 'matrix' (counts_matrix.csv + coldata.csv), or 'both'.
+    source: 'salmon' or 'star'. Raw counts either way.
+    """
+    features, data = _collect_rnaseq_counts(samples, source, tx2gene)
+    written: list[Path] = []
+
+    if fmt in ("obama", "both"):
+        obama_path = outdir / "obama_matrix.csv"
+        _write(obama_path, samples, features, lambda name, feat: data[name].get(feat, 0.0))
+        written.append(obama_path)
+
+    if fmt in ("matrix", "both"):
+        counts_path = outdir / "counts_matrix.csv"
+        coldata_path = outdir / "coldata.csv"
+        _write_counts_matrix(counts_path, coldata_path, samples, features, data)
+        written += [counts_path, coldata_path]
+
+    return written
+
+
+def _write_counts_matrix(
+    counts_path: Path,
+    coldata_path: Path,
+    samples: list[tuple[str, str, Path]],
+    features: list[str],
+    data: dict[str, dict[str, float]],
+) -> None:
+    """Write a feature x sample integer count matrix + a coldata table.
+
+    Counts are rounded to integers so DESeqDataSetFromMatrix() accepts them
+    directly (Salmon NumReads are fractional); STAR counts are already integers.
+    """
+    names = [name for name, _g, _p in samples]
+    with counts_path.open("w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["gene"] + names)
+        for feat in features:
+            writer.writerow([feat] + [int(round(data[name].get(feat, 0.0))) for name in names])
+
+    with coldata_path.open("w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["sample", "condition"])
+        for name, group, _p in samples:
+            writer.writerow([name, group])
 
 
 def build_rnaseq(
     samples: list[tuple[str, str, Path]],  # (name, group, salmon_quant_dir)
     out_path: Path,
+    tx2gene: Optional[dict[str, str]] = None,
 ) -> None:
-    """Merge Salmon quant.sf files (TPM column) into one OBAMA CSV."""
-    transcripts: list[str] = []
-    data: dict[str, dict] = {}
-
-    for name, group, quant_dir in samples:
-        sf = quant_dir / "quant.sf"
-        data[name] = {"group": group, "tpm": {}}
-        for row in csv.DictReader(sf.open(), delimiter="\t"):
-            tx = row["Name"]
-            data[name]["tpm"][tx] = float(row["TPM"])
-            if name == samples[0][0]:
-                transcripts.append(tx)
-
-    _write(out_path, samples, transcripts, lambda name, feat: data[name]["tpm"].get(feat, 0.0))
+    """OBAMA CSV from Salmon NumReads (raw counts), optionally gene-level."""
+    features, data = _collect_rnaseq_counts(samples, "salmon", tx2gene)
+    _write(out_path, samples, features, lambda name, feat: data[name].get(feat, 0.0))
 
 
 def build_atacseq(
@@ -62,25 +221,9 @@ def build_rnaseq_star(
     samples: list[tuple[str, str, Path]],  # (name, group, ReadsPerGene.out.tab path)
     out_path: Path,
 ) -> None:
-    """Merge STAR ReadsPerGene.out.tab files (unstranded counts) into one OBAMA CSV."""
-    genes: list[str] = []
-    data: dict[str, dict] = {}
-
-    for name, group, tab_path in samples:
-        data[name] = {"group": group, "counts": {}}
-        for line in tab_path.read_text().splitlines():
-            if line.startswith("N_"):   # skip STAR summary rows (N_unmapped etc.)
-                continue
-            parts = line.split("\t")
-            if len(parts) < 2:
-                continue
-            gene_id = parts[0]
-            count   = float(parts[1])   # column 1 = unstranded read count
-            data[name]["counts"][gene_id] = count
-            if name == samples[0][0]:
-                genes.append(gene_id)
-
-    _write(out_path, samples, genes, lambda name, feat: data[name]["counts"].get(feat, 0.0))
+    """OBAMA CSV from STAR ReadsPerGene.out.tab unstranded counts (gene-level)."""
+    features, data = _collect_rnaseq_counts(samples, "star", None)
+    _write(out_path, samples, features, lambda name, feat: data[name].get(feat, 0.0))
 
 
 def build_methylation(

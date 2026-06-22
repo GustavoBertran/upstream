@@ -191,14 +191,30 @@ def rnaseq(
     star_index: Annotated[Optional[Path], typer.Option(
         "--star-index", help="Pre-built STAR genome index directory (required for --aligner star).",
     )] = None,
+    output_format: Annotated[str, typer.Option(
+        "--format",
+        help="Output: 'obama' (default), 'matrix' (counts_matrix.csv + coldata.csv for "
+             "DESeq2/edgeR/limma-voom), or 'both'.",
+    )] = "obama",
+    gtf: Annotated[Optional[Path], typer.Option(
+        "--gtf", help="GTF (GENCODE/Ensembl) for Salmon transcript→gene aggregation → gene-level counts.",
+    )] = None,
+    tx2gene: Annotated[Optional[Path], typer.Option(
+        "--tx2gene", help="2-column CSV (transcript_id,gene) for Salmon gene-level aggregation. Overrides --gtf.",
+    )] = None,
     threads: ThreadsOpt = 4,
     explain: ExplainOpt = True,
 ) -> None:
-    """RNA-seq: trim (fastp) → align/quantify (STAR or Salmon) → OBAMA matrix.
+    """RNA-seq: trim (fastp) → align/quantify (STAR or Salmon) → counts matrix.
 
-    Use --aligner salmon (default) for alignment-free TPM quantification via Salmon.
-    Use --aligner star for genome alignment with STAR; gene counts are produced via
-    STAR's built-in --quantMode GeneCounts (no separate quantification tool needed).
+    Use --aligner salmon (default) for alignment-free quantification via Salmon, or
+    --aligner star for genome alignment with STAR (gene counts via --quantMode
+    GeneCounts). Both produce RAW COUNTS — Salmon NumReads, STAR ReadsPerGene.
+
+    Output is the OBAMA matrix by default; --format matrix (or both) also writes a
+    feature x sample counts_matrix.csv + coldata.csv for DESeq2/edgeR/limma-voom.
+    For gene-level Salmon counts, pass --gtf (or --tx2gene); otherwise Salmon output
+    stays transcript-level.
     """
     if aligner not in ("salmon", "star"):
         _die("--aligner must be 'salmon' or 'star'.")
@@ -206,6 +222,12 @@ def rnaseq(
         _die("--salmon-index is required when --aligner salmon.")
     if aligner == "star" and star_index is None:
         _die("--star-index is required when --aligner star.")
+    if output_format not in ("obama", "matrix", "both"):
+        _die("--format must be 'obama', 'matrix', or 'both'.")
+    if gtf is not None and not gtf.exists():
+        _die(f"GTF not found: {gtf}")
+    if tx2gene is not None and not tx2gene.exists():
+        _die(f"tx2gene file not found: {tx2gene}")
 
     sample_list = _read_samplesheet(samples)
     if aligner == "salmon":
@@ -293,16 +315,33 @@ def rnaseq(
             ))
             result_dirs.append((name, group, aln_dir / f"{name}_ReadsPerGene.out.tab"))
 
-    # 3 — OBAMA matrix
-    runner.step_header("OBAMA matrix", 3, TOTAL)
-    matrix_path = outdir / "obama_matrix.csv"
-    if aligner == "salmon":
-        obama.build_rnaseq(result_dirs, matrix_path)
-    else:
-        obama.build_rnaseq_star(result_dirs, matrix_path)
-    _check(*checkpoints.check_obama_format(matrix_path))
+    # 3 — Build output matrices (OBAMA and/or DESeq2/edgeR/limma matrix)
+    runner.step_header("Build matrix output", 3, TOTAL)
+    if explain and output_format in ("matrix", "both"):
+        _explain("rnaseq_export_formats.md")
 
-    console.print(f"\n[bold green]Done.[/bold green] OBAMA matrix → {matrix_path}")
+    source = "salmon" if aligner == "salmon" else "star"
+    tx2gene_map = None
+    if source == "salmon":
+        if gtf or tx2gene:
+            tx2gene_map = obama.load_tx2gene(gtf, tx2gene)
+            if tx2gene_map is None:
+                _die("Could not build a transcript→gene map from the provided --gtf/--tx2gene.")
+            console.print(f"  Aggregating transcripts → genes ({len(tx2gene_map):,} mappings).")
+        elif output_format in ("matrix", "both"):
+            console.print(
+                "[yellow]Note:[/yellow] no --gtf/--tx2gene given — Salmon counts stay "
+                "transcript-level. DESeq2/edgeR are usually run at gene level."
+            )
+
+    written = obama.write_rnaseq_outputs(result_dirs, outdir, output_format, source, tx2gene_map)
+
+    if output_format in ("obama", "both"):
+        _check(*checkpoints.check_obama_format(outdir / "obama_matrix.csv"))
+    if output_format in ("matrix", "both"):
+        _check(*checkpoints.check_counts_matrix(outdir / "counts_matrix.csv", outdir / "coldata.csv"))
+
+    console.print(f"\n[bold green]Done.[/bold green] Wrote: {', '.join(p.name for p in written)} → {outdir}")
 
 
 # ── ATAC-seq ──────────────────────────────────────────────────────────────

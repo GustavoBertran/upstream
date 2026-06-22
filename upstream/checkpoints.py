@@ -149,6 +149,44 @@ def check_methylation_cx_report(report_path: Path) -> tuple[bool, str]:
 _VALID_GROUPS = {"disease", "control"}
 
 
+def check_counts_matrix(counts_path: Path, coldata_path: Path) -> tuple[bool, str]:
+    """Validate the DESeq2/edgeR/limma matrix export: counts matrix + coldata.
+
+    Checks that both files exist, their sample sets match exactly, and the
+    condition labels are the OBAMA-compatible 'disease'/'control'.
+    """
+    if not counts_path.exists():
+        return False, f"Counts matrix not found: {counts_path}"
+    if not coldata_path.exists():
+        return False, f"coldata not found: {coldata_path}"
+
+    clines = [l for l in counts_path.read_text().splitlines() if l.strip()]
+    if len(clines) < 2:
+        return False, "Counts matrix needs a header and at least one feature row."
+    sep = "\t" if "\t" in clines[0] else ","
+    matrix_samples = [c.strip() for c in clines[0].split(sep)][1:]  # drop the 'gene' column
+
+    dlines = [l for l in coldata_path.read_text().splitlines() if l.strip()]
+    dsep = "\t" if "\t" in dlines[0] else ","
+    coldata_samples, conditions = [], []
+    for row in dlines[1:]:
+        cells = [c.strip() for c in row.split(dsep)]
+        if len(cells) >= 2:
+            coldata_samples.append(cells[0])
+            conditions.append(cells[1])
+
+    if set(matrix_samples) != set(coldata_samples):
+        return False, ("Sample mismatch between counts matrix columns and coldata rows — "
+                       "DESeq2/edgeR require them to align.")
+    bad = {c for c in conditions if c not in _VALID_GROUPS}
+    if bad:
+        return False, f"condition must be 'disease' or 'control'. Invalid value(s): {', '.join(bad)}."
+
+    n_features = len(clines) - 1
+    return True, (f"Matrix OK — {n_features:,} feature(s) x {len(matrix_samples)} sample(s), "
+                  "coldata aligned.")
+
+
 def check_obama_format(csv_path: Path) -> tuple[bool, str]:
     if not csv_path.exists():
         return False, f"Output file not found: {csv_path}"

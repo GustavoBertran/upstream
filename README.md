@@ -99,6 +99,21 @@ upstream rnaseq \
   --outdir results/rnaseq/
 ```
 
+**Output format (OBAMA vs DESeq2/edgeR/limma):**
+
+RNA-seq emits the OBAMA matrix by default. Add `--format matrix` (or `--format both`)
+to also write `counts_matrix.csv` (features × samples) + `coldata.csv` — the raw-count
+inputs DESeq2, edgeR, and limma-voom expect. For gene-level Salmon counts, pass a
+`--gtf` (or `--tx2gene`) so transcripts are aggregated to genes; STAR is already
+gene-level. Both layouts use raw counts (Salmon `NumReads`, STAR `ReadsPerGene`).
+
+```bash
+upstream rnaseq --samples samples.csv --aligner salmon \
+  --salmon-index /path/to/salmon_hg38 \
+  --gtf /path/to/gencode.annotation.gtf.gz \
+  --format both --outdir results/rnaseq/
+```
+
 **ATAC-seq:**
 ```bash
 upstream atacseq \
