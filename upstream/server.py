@@ -1044,7 +1044,7 @@ function renderSummaryTable() {
 }
 
 function resetGeoGroups() {
-  for (var i = 0; i < _geoRows.length; i++) { _geoRows[i].group = "disease"; }
+  for (var i = 0; i < _geoRows.length; i++) { _geoRows[i].group = "skip"; }
   renderGeoTable();  // re-renders dropdowns from _geoRows (summary re-renders inside)
 }
 
@@ -1071,7 +1071,7 @@ async function fetchGSE() {
       data.gse+" — "+data.title+" — "+data.organism+" — "+data.n_samples+" samples";
 
     _geoRows = data.samples.map(function(s){
-      return {gsm:s.gsm, title:s.title, srr:null, group:"disease"};
+      return {gsm:s.gsm, title:s.title, srr:null, group:"skip"};
     });
     _buildGeoHeader();
     renderGeoTable();
