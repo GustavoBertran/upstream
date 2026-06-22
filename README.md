@@ -131,6 +131,11 @@ upstream methylation \
   --outdir results/methylation/
 ```
 
+Like RNA-seq, methylation accepts `--format matrix` (or `both`) to also write an
+`mvalues_matrix.csv` (features × samples) + `coldata.csv` for **limma** — M-values
+(`log2(beta/(1-beta))`), which limma models instead of beta/percent. Works for both
+`--method wgbs` and `--method array`.
+
 **DNA Methylation — Illumina array (450K / EPIC, from GEO):**
 
 No FASTQ files needed — provide the beta-value matrix downloaded from GEO

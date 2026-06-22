@@ -494,12 +494,24 @@ def methylation(
                     help="Beta matrix CSV from GEO (for --method array).")] = None,
     metadata: Annotated[Optional[Path], typer.Option("--metadata",
                         help="Metadata CSV with geo_accession and disease.state (for --method array).")] = None,
+    output_format: Annotated[str, typer.Option(
+        "--format",
+        help="Output: 'obama' (default), 'matrix' (mvalues_matrix.csv + coldata.csv for "
+             "limma), or 'both'. M-values = log2(beta/(1-beta)).",
+    )] = "obama",
     threads: ThreadsOpt = 4,
     explain: ExplainOpt = True,
 ) -> None:
-    """Methylation: WGBS (Bismark pipeline) or Illumina array (450K/EPIC beta matrix from GEO)."""
+    """Methylation: WGBS (Bismark pipeline) or Illumina array (450K/EPIC beta matrix from GEO).
+
+    Output is the OBAMA matrix by default; --format matrix (or both) also writes an
+    M-value matrix (features × samples) + coldata.csv for limma. limma models
+    M-values, not beta/percent values.
+    """
     if method not in ("wgbs", "array"):
         _die(f"Unknown --method: {method!r}. Use 'wgbs' or 'array'.")
+    if output_format not in ("obama", "matrix", "both"):
+        _die("--format must be 'obama', 'matrix', or 'both'.")
 
     outdir.mkdir(parents=True, exist_ok=True)
 
@@ -514,18 +526,23 @@ def methylation(
             _die(f"Metadata file not found: {metadata}")
 
         TOTAL = 1
-        console.print(f"\n[bold]Methylation (array) pipeline[/bold] — building OBAMA matrix\n")
-        runner.step_header("OBAMA matrix — merge beta values with metadata", 1, TOTAL)
+        console.print(f"\n[bold]Methylation (array) pipeline[/bold] — building matrices\n")
+        runner.step_header("Merge beta values with metadata", 1, TOTAL)
         if explain:
             _explain("methylation_array.md")
+            if output_format in ("matrix", "both"):
+                _explain("methylation_export_formats.md")
 
-        matrix_path = outdir / "obama_matrix.csv"
         try:
-            obama.build_methylation_array(betas, metadata, matrix_path)
+            written = obama.write_methylation_array_outputs(betas, metadata, outdir, output_format)
         except ValueError as e:
             _die(str(e))
-        _check(*checkpoints.check_obama_format(matrix_path))
-        console.print(f"\n[bold green]Done.[/bold green] OBAMA matrix → {matrix_path}")
+        if output_format in ("obama", "both"):
+            _check(*checkpoints.check_obama_format(outdir / "obama_matrix.csv"))
+        if output_format in ("matrix", "both"):
+            _check(*checkpoints.check_counts_matrix(outdir / "mvalues_matrix.csv", outdir / "coldata.csv"))
+        console.print(f"\n[bold green]Done.[/bold green] Wrote: "
+                      f"{', '.join(p.name for p in written)} → {outdir}")
         return
 
     # ── WGBS path ──
@@ -626,13 +643,18 @@ def methylation(
 
         cx_reports.append((name, group, cx_report))
 
-    # 4 — OBAMA matrix
-    runner.step_header("OBAMA matrix", 4, TOTAL)
-    matrix_path = outdir / "obama_matrix.csv"
-    obama.build_methylation(cx_reports, matrix_path)
-    _check(*checkpoints.check_obama_format(matrix_path))
+    # 4 — Build output matrices (OBAMA percent-methylation and/or limma M-values)
+    runner.step_header("Build matrix output", 4, TOTAL)
+    if explain and output_format in ("matrix", "both"):
+        _explain("methylation_export_formats.md")
+    written = obama.write_methylation_outputs(cx_reports, outdir, output_format)
+    if output_format in ("obama", "both"):
+        _check(*checkpoints.check_obama_format(outdir / "obama_matrix.csv"))
+    if output_format in ("matrix", "both"):
+        _check(*checkpoints.check_counts_matrix(outdir / "mvalues_matrix.csv", outdir / "coldata.csv"))
 
-    console.print(f"\n[bold green]Done.[/bold green] OBAMA matrix → {matrix_path}")
+    console.print(f"\n[bold green]Done.[/bold green] Wrote: "
+                  f"{', '.join(p.name for p in written)} → {outdir}")
 
 
 # ── Download ───────────────────────────────────────────────────────────────

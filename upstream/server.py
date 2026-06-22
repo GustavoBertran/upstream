@@ -136,6 +136,8 @@ def _build_cmd(req: RunRequest) -> list[str]:
             "--metadata", req.metadata_csv or "",
             "--outdir",   req.outdir,
         ]
+        if req.output_format:
+            cmd += ["--format", req.output_format]
         if not req.explain:
             cmd.append("--no-explain")
         return cmd
@@ -160,9 +162,9 @@ def _build_cmd(req: RunRequest) -> list[str]:
         cmd += ["--bowtie2-index", req.bowtie2_index]
     if req.bismark_genome:
         cmd += ["--bismark-genome", req.bismark_genome]
+    if req.output_format and req.track in ("rnaseq", "methylation"):
+        cmd += ["--format", req.output_format]
     if req.track == "rnaseq":
-        if req.output_format:
-            cmd += ["--format", req.output_format]
         if req.gtf:
             cmd += ["--gtf", req.gtf]
         if req.tx2gene:
@@ -921,6 +923,14 @@ function selectTrack(id) {
             '<option value="array">450K / EPIC array — GEO beta matrix</option>' +
           '</select>' +
         '</div>' +
+        '<div class="field full">' +
+          '<label>Output format</label>' +
+          '<select id="inp-format">' +
+            '<option value="obama">OBAMA matrix (samples × features)</option>' +
+            '<option value="matrix">limma — M-value matrix + coldata</option>' +
+            '<option value="both">Both</option>' +
+          '</select>' +
+        '</div>' +
         '<div id="meth-extra-fields" style="display:contents"></div>';
       updateMethylationMethod();
     } else {
@@ -1485,6 +1495,7 @@ async function startRun() {
   if (TRACKS[track].isMethylation) {
     const method = (document.getElementById("inp-meth-method") || {value:"wgbs"}).value;
     body.method = method;
+    body.output_format = (document.getElementById("inp-format") || {value:"obama"}).value;
     if (method === "array") {
       const betas   = (document.getElementById("inp-betas")        || {value:""}).value.trim();
       const metaCsv = (document.getElementById("inp-metadata-csv") || {value:""}).value.trim();

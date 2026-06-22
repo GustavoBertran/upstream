@@ -20,9 +20,32 @@ aggregated transcript -> gene via a tx2gene map) and STAR ReadsPerGene counts.
 
 import csv
 import gzip
+import math
 import re
 from pathlib import Path
 from typing import Optional
+
+
+# ── shared helpers for the matrix/coldata export ─────────────────────────────
+
+
+def _write_coldata(path: Path, rows: list[tuple[str, str]]) -> None:
+    """Write a coldata table: sample,condition (condition = disease/control)."""
+    with path.open("w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["sample", "condition"])
+        writer.writerows(rows)
+
+
+def _beta_to_mvalue(beta: float, eps: float = 1e-3) -> float:
+    """M-value = log2(beta / (1 - beta)); beta clamped to [eps, 1-eps] to avoid ±inf."""
+    b = min(max(beta, eps), 1.0 - eps)
+    return round(math.log2(b / (1.0 - b)), 4)
+
+
+def _counts_to_mvalue(methylated: int, unmethylated: int, alpha: float = 1.0) -> float:
+    """WGBS M-value from read counts: log2((M + a) / (U + a)); pseudocount avoids ±inf."""
+    return round(math.log2((methylated + alpha) / (unmethylated + alpha)), 4)
 
 
 # ── tx2gene ────────────────────────────────────────────────────────────────
@@ -192,11 +215,7 @@ def _write_counts_matrix(
         for feat in features:
             writer.writerow([feat] + [int(round(data[name].get(feat, 0.0))) for name in names])
 
-    with coldata_path.open("w", newline="") as f:
-        writer = csv.writer(f)
-        writer.writerow(["sample", "condition"])
-        for name, group, _p in samples:
-            writer.writerow([name, group])
+    _write_coldata(coldata_path, [(name, group) for name, group, _p in samples])
 
 
 def build_rnaseq(
@@ -242,50 +261,101 @@ def build_rnaseq_star(
     _write(out_path, samples, features, lambda name, feat: data[name].get(feat, 0.0))
 
 
-def build_methylation(
-    samples: list[tuple[str, str, Path]],  # (name, group, CX_report_path)
-    out_path: Path,
-    min_coverage: int = 1,
-) -> None:
-    """Build CpG percent-methylation matrix from Bismark CX reports.
+def _collect_wgbs_counts(
+    samples: list[tuple[str, str, Path]],
+    min_coverage: int,
+) -> tuple[list[str], dict[str, dict[str, tuple[int, int]]]]:
+    """Parse Bismark CX reports → (shared CpGs ordered, {sample: {cpg: (meth, unmeth)}}).
 
-    Only CpGs covered at >= min_coverage reads in EVERY sample are included.
-    This intersection avoids imputing 0% methylation for uncovered sites, which
-    would generate false differences between samples in OBAMA.
+    CX report columns (tab): chrom, pos, strand, count_methylated, count_unmethylated,
+    context, trinucleotide. Coverage = methylated + unmethylated. Only CpG-context
+    sites covered at >= min_coverage in EVERY sample are kept (the intersection avoids
+    imputing values for uncovered sites, which would fabricate between-sample
+    differences).
     """
-    data: dict[str, dict[str, float]] = {}
+    data: dict[str, dict[str, tuple[int, int]]] = {}
     covered_per_sample: list[set[str]] = []
 
-    for name, group, cx_report in samples:
+    for name, _group, cx_report in samples:
         data[name] = {}
         covered: set[str] = set()
         for line in cx_report.read_text().splitlines():
             parts = line.split("\t")
             if len(parts) < 6:
                 continue
-            chrom, pos, _, coverage, methylated, context, *_ = parts
-            if int(coverage) < min_coverage:
-                continue
+            chrom, pos, _strand, meth, unmeth, context = parts[:6]
             if "CG" not in context:  # CpG only
                 continue
+            m, u = int(meth), int(unmeth)
+            if m + u < min_coverage:
+                continue
             cpg_id = f"{chrom}:{pos}"
-            data[name][cpg_id] = round(int(methylated) / int(coverage) * 100, 2)
+            data[name][cpg_id] = (m, u)
             covered.add(cpg_id)
         covered_per_sample.append(covered)
 
-    # Restrict to sites covered in all samples; preserve order from sample[0].
-    shared = covered_per_sample[0].intersection(*covered_per_sample[1:]) if len(covered_per_sample) > 1 else covered_per_sample[0]
+    shared = (covered_per_sample[0].intersection(*covered_per_sample[1:])
+              if len(covered_per_sample) > 1 else covered_per_sample[0])
     cpgs = [cpg for cpg in data[samples[0][0]] if cpg in shared]
+    return cpgs, data
 
-    _write(out_path, samples, cpgs, lambda name, feat: data[name][feat])
+
+def build_methylation(
+    samples: list[tuple[str, str, Path]],  # (name, group, CX_report_path)
+    out_path: Path,
+    min_coverage: int = 1,
+) -> None:
+    """OBAMA CpG percent-methylation matrix from Bismark CX reports."""
+    cpgs, data = _collect_wgbs_counts(samples, min_coverage)
+
+    def pct(name: str, cpg: str) -> float:
+        m, u = data[name][cpg]
+        cov = m + u
+        return round(m / cov * 100, 2) if cov else 0.0
+
+    _write(out_path, samples, cpgs, pct)
 
 
-def build_methylation_array(
+def write_methylation_outputs(
+    samples: list[tuple[str, str, Path]],  # (name, group, CX_report_path)
+    outdir: Path,
+    fmt: str,
+    min_coverage: int = 1,
+) -> list[Path]:
+    """Write WGBS results: OBAMA percent-methylation and/or M-value matrix + coldata.
+
+    fmt: 'obama' (default), 'matrix' (mvalues_matrix.csv + coldata.csv for limma),
+    or 'both'. M-values use log2((M+1)/(U+1)) from read counts.
+    """
+    cpgs, data = _collect_wgbs_counts(samples, min_coverage)
+    names = [n for n, _g, _p in samples]
+    written: list[Path] = []
+
+    if fmt in ("obama", "both"):
+        obama_path = outdir / "obama_matrix.csv"
+        _write(obama_path, samples, cpgs,
+               lambda name, cpg: (lambda m, u: round(m / (m + u) * 100, 2) if (m + u) else 0.0)(*data[name][cpg]))
+        written.append(obama_path)
+
+    if fmt in ("matrix", "both"):
+        mpath = outdir / "mvalues_matrix.csv"
+        cpath = outdir / "coldata.csv"
+        with mpath.open("w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(["cpg"] + names)
+            for cpg in cpgs:
+                writer.writerow([cpg] + [_counts_to_mvalue(*data[name][cpg]) for name in names])
+        _write_coldata(cpath, [(n, g) for n, g, _p in samples])
+        written += [mpath, cpath]
+
+    return written
+
+
+def _parse_beta_matrix(
     betas_path: Path,
     metadata_path: Path,
-    out_path: Path,
-) -> None:
-    """Build OBAMA CSV from an Illumina 450K / EPIC beta-value matrix.
+) -> tuple[list[str], list[str], dict[str, list[float]], dict[str, str]]:
+    """Parse a 450K/EPIC beta matrix + metadata → (samples, probes, betas, meta).
 
     Supports two layouts automatically:
     - Probes-as-rows: first column = probe IDs (header cell "ID_REF" or ""),
@@ -384,11 +454,57 @@ def build_methylation_array(
             "Verify that the metadata accessions match the beta matrix column headers."
         )
 
+    return samples_ordered, valid_probes, out_data, meta
+
+
+def _write_beta_obama(out_path, samples_ordered, valid_probes, out_data, meta) -> None:
     with out_path.open("w", newline="") as f:
         writer = csv.writer(f)
         writer.writerow(["geo_accession", "disease.state"] + valid_probes)
         for acc in samples_ordered:
             writer.writerow([acc, meta[acc]] + out_data[acc])
+
+
+def build_methylation_array(
+    betas_path: Path,
+    metadata_path: Path,
+    out_path: Path,
+) -> None:
+    """OBAMA CSV (samples x probes, beta values) from a 450K/EPIC beta matrix."""
+    samples_ordered, valid_probes, out_data, meta = _parse_beta_matrix(betas_path, metadata_path)
+    _write_beta_obama(out_path, samples_ordered, valid_probes, out_data, meta)
+
+
+def write_methylation_array_outputs(
+    betas_path: Path,
+    metadata_path: Path,
+    outdir: Path,
+    fmt: str,
+) -> list[Path]:
+    """Write array results: OBAMA beta matrix and/or M-value matrix + coldata (limma).
+
+    M-value = log2(beta/(1-beta)); limma is run on M-values, not betas.
+    """
+    samples_ordered, valid_probes, out_data, meta = _parse_beta_matrix(betas_path, metadata_path)
+    written: list[Path] = []
+
+    if fmt in ("obama", "both"):
+        obama_path = outdir / "obama_matrix.csv"
+        _write_beta_obama(obama_path, samples_ordered, valid_probes, out_data, meta)
+        written.append(obama_path)
+
+    if fmt in ("matrix", "both"):
+        mpath = outdir / "mvalues_matrix.csv"
+        cpath = outdir / "coldata.csv"
+        with mpath.open("w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(["probe"] + samples_ordered)
+            for i, probe in enumerate(valid_probes):
+                writer.writerow([probe] + [_beta_to_mvalue(out_data[acc][i]) for acc in samples_ordered])
+        _write_coldata(cpath, [(acc, meta[acc]) for acc in samples_ordered])
+        written += [mpath, cpath]
+
+    return written
 
 
 def _write(
