@@ -99,6 +99,22 @@ def _read_salmon_counts(quant_dir: Path, tx2gene: Optional[dict[str, str]]) -> d
     return counts
 
 
+def salmon_tx2gene_match(quant_dir: Path, tx2gene: dict[str, str]) -> tuple[int, int]:
+    """Return (matched, total) quant.sf transcripts that map via tx2gene.
+
+    Lets callers detect a release/ID mismatch (e.g. a non-GENCODE index) that
+    would silently leave output transcript-level despite a populated tx2gene map.
+    """
+    matched = total = 0
+    with (quant_dir / "quant.sf").open() as f:
+        for row in csv.DictReader(f, delimiter="\t"):
+            total += 1
+            tx = row["Name"]
+            if tx in tx2gene or tx.split(".")[0] in tx2gene:
+                matched += 1
+    return matched, total
+
+
 def _read_star_counts(tab_path: Path) -> dict[str, float]:
     """Read STAR ReadsPerGene.out.tab unstranded counts (column 1), gene-level."""
     counts: dict[str, float] = {}

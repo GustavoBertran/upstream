@@ -327,7 +327,18 @@ def rnaseq(
             tx2gene_map = obama.load_tx2gene(gtf, tx2gene)
             if tx2gene_map is None:
                 _die("Could not build a transcript→gene map from the provided --gtf/--tx2gene.")
-            console.print(f"  Aggregating transcripts → genes ({len(tx2gene_map):,} mappings).")
+            matched, total = obama.salmon_tx2gene_match(result_dirs[0][2], tx2gene_map)
+            pct = (matched / total * 100) if total else 0
+            console.print(
+                f"  Transcript→gene map: {len(tx2gene_map):,} mappings; matched "
+                f"{matched:,}/{total:,} quantified transcripts ({pct:.0f}%)."
+            )
+            if pct < 50:
+                console.print(
+                    "[yellow]Warning:[/yellow] under half of quantified transcripts matched the "
+                    "tx2gene map. Was the Salmon index built from the same GENCODE/Ensembl release "
+                    "(versioned IDs)? Output may stay largely transcript-level."
+                )
         elif output_format in ("matrix", "both"):
             console.print(
                 "[yellow]Note:[/yellow] no --gtf/--tx2gene given — Salmon counts stay "
