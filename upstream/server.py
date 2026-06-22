@@ -27,6 +27,8 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse, StreamingResponse
 from pydantic import BaseModel
 
+from . import preflight
+
 _ANSI_RE = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]")
 
 app = FastAPI(title="upstream", docs_url=None, redoc_url=None)
@@ -94,6 +96,26 @@ def stream(run_id: str) -> StreamingResponse:
     if run_id not in _runs:
         raise HTTPException(404, "run not found")
     return StreamingResponse(_sse_generator(run_id), media_type="text/event-stream")
+
+
+def _preflight_issues(req: "RunRequest") -> list[str]:
+    if req.track == "download_geo":
+        return [f"tool: '{t}' not found on PATH (activate the environment?)"
+                for t in preflight.missing_tools(preflight.required_tools("download_geo"))]
+    return preflight.run_issues(
+        req.track,
+        samples=req.samples,
+        aligner=req.aligner, method=req.method, output_format=req.output_format,
+        salmon_index=req.salmon_index, star_index=req.star_index,
+        bismark_genome=req.bismark_genome,
+        betas=req.betas, metadata=req.metadata_csv,
+    )
+
+
+@app.post("/api/check")
+def api_check(req: RunRequest) -> dict:
+    """Pre-run validation for the web UI's Run gate. Returns {issues: [...]}."""
+    return {"issues": _preflight_issues(req)}
 
 
 @app.post("/api/cancel/{run_id}")
@@ -1589,6 +1611,20 @@ async function startRun() {
 }
 
 async function _kickoffRun(body, label, nsteps) {
+  // Preflight: validate samplesheet, tools, and paths before starting (pipeline tracks;
+  // the GEO download checks its own tools server-side). Surfaced in the setup form.
+  if (body.track !== "download_geo") {
+    try {
+      const cr = await (await fetch("/api/check", {
+        method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify(body)
+      })).json();
+      if (cr.issues && cr.issues.length) {
+        err("Preflight found " + cr.issues.length + " problem(s) — fix before running:  •  "
+            + cr.issues.join("  •  "));
+        return;
+      }
+    } catch (e) { /* if the check endpoint is unreachable, fall through and let the run report errors */ }
+  }
   _runNsteps = nsteps;
   document.getElementById("setup-panel").style.display = "none";
   document.getElementById("log-panel").style.display = "flex";

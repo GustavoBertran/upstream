@@ -28,7 +28,7 @@ from rich.console import Console
 from rich.markdown import Markdown
 from rich.panel import Panel
 
-from . import checkpoints, downloader, obama, runner
+from . import checkpoints, downloader, obama, preflight, runner
 
 app = typer.Typer(
     name="htsprep",
@@ -51,31 +51,21 @@ ExplainOpt = Annotated[bool, typer.Option("--explain/--no-explain",
 
 
 def _read_samplesheet(path: Path, allow_input: bool = False) -> list[dict[str, str]]:
-    if not path.exists():
-        _die(f"Samplesheet not found: {path}")
+    issues = preflight.validate_samplesheet(path, allow_input)
+    if issues:
+        _die("samplesheet problems found:\n  - " + "\n  - ".join(issues))
     with path.open() as f:
-        reader = csv.DictReader(f)
-        missing_cols = {"name", "group", "r1", "r2"} - set(reader.fieldnames or [])
-        if missing_cols:
-            _die(f"Samplesheet is missing columns: {', '.join(sorted(missing_cols))}")
-        rows = list(reader)
+        return list(csv.DictReader(f))
 
-    valid_groups = {"disease", "control"} | ({"input"} if allow_input else set())
-    for row in rows:
-        if row["group"] not in valid_groups:
-            extra = " or 'input'" if allow_input else ""
-            _die(
-                f"Invalid group '{row['group']}' for sample '{row['name']}'. "
-                f"Must be 'disease' or 'control'{extra} (OBAMA requires the exact strings "
-                "'disease'/'control')."
-            )
-        # r1 is always required; r2 is optional (empty = single-end).
-        if not Path(row["r1"]).exists():
-            _die(f"File not found for sample '{row['name']}': {row['r1']}")
-        r2 = (row.get("r2") or "").strip()
-        if r2 and not Path(r2).exists():
-            _die(f"File not found for sample '{row['name']}': {r2}")
-    return rows
+
+def _require_tools(track: str, **opts) -> None:
+    """Fail fast with a clear message if a track's tools aren't on PATH."""
+    missing = preflight.missing_tools(preflight.required_tools(track, **opts))
+    if missing:
+        _die(
+            f"required tool(s) not found on PATH: {', '.join(missing)}. "
+            "Activate the environment first (conda activate upstream)."
+        )
 
 
 def _is_paired(s: dict) -> bool:
@@ -201,6 +191,7 @@ def qc(
 ) -> None:
     """FastQC + MultiQC quality control on all samples in the samplesheet."""
     sample_list = _read_samplesheet(samples)
+    _require_tools("qc")
     outdir.mkdir(parents=True, exist_ok=True)
     console.print(f"\n[bold]QC pipeline[/bold] — {len(sample_list)} sample(s) → {outdir}\n")
 
@@ -289,6 +280,7 @@ def rnaseq(
         _die(f"tx2gene file not found: {tx2gene}")
 
     sample_list = _read_samplesheet(samples)
+    _require_tools("rnaseq", aligner=aligner, output_format=output_format)
     if aligner == "salmon":
         _require_dir(salmon_index, "Salmon index")
     else:
@@ -440,6 +432,7 @@ def atacseq(
     if output_format not in ("obama", "matrix", "both"):
         _die("--format must be 'obama', 'matrix', or 'both'.")
     sample_list = _read_samplesheet(samples)
+    _require_tools("atacseq", output_format=output_format)
     bt2_prefix = bowtie2_index  # e.g. /ref/bowtie2/hg38 (no .bt2 extension)
     outdir.mkdir(parents=True, exist_ok=True)
 
@@ -596,6 +589,7 @@ def chipseq(
         if ctl and ctl not in inputs:
             _die(f"control '{ctl}' for sample '{s['name']}' must name a group=input row.")
 
+    _require_tools("chipseq", output_format=output_format)
     bt2_prefix = bowtie2_index
     outdir.mkdir(parents=True, exist_ok=True)
 
@@ -779,6 +773,7 @@ def methylation(
     if not bismark_genome:
         _die("--bismark-genome is required for --method wgbs.")
     sample_list = _read_samplesheet(samples)
+    _require_tools("methylation", method="wgbs")
     _require_dir(bismark_genome, "Bismark genome directory")
 
     TOTAL = 4
@@ -883,6 +878,49 @@ def methylation(
 
     console.print(f"\n[bold green]Done.[/bold green] Wrote: "
                   f"{', '.join(p.name for p in written)} → {outdir}")
+
+
+# ── Check (preflight) ────────────────────────────────────────────────────────
+
+
+@app.command()
+def check(
+    track: Annotated[str, typer.Option(
+        "--track", help="Track to validate: qc, rnaseq, atacseq, chipseq, methylation.")],
+    samples: Annotated[Optional[Path], typer.Option("--samples", help="Samplesheet to validate.")] = None,
+    aligner: Annotated[str, typer.Option("--aligner", help="rnaseq aligner (salmon/star).")] = "salmon",
+    method: Annotated[str, typer.Option("--method", help="methylation method (wgbs/array).")] = "wgbs",
+    output_format: Annotated[str, typer.Option("--format", help="Output format you plan to use.")] = "obama",
+    salmon_index: Annotated[Optional[Path], typer.Option("--salmon-index")] = None,
+    star_index: Annotated[Optional[Path], typer.Option("--star-index")] = None,
+    bowtie2_index: Annotated[Optional[Path], typer.Option("--bowtie2-index")] = None,
+    bismark_genome: Annotated[Optional[Path], typer.Option("--bismark-genome")] = None,
+    betas: Annotated[Optional[Path], typer.Option("--betas")] = None,
+    metadata: Annotated[Optional[Path], typer.Option("--metadata")] = None,
+) -> None:
+    """Validate a run's inputs WITHOUT running anything.
+
+    Reports every problem at once — bad samplesheet rows, missing FASTQ files,
+    invalid group labels, unmatched ChIP controls, tools not on PATH, and missing
+    index/genome directories — so you can fix them before a long run starts.
+    """
+    issues = preflight.run_issues(
+        track,
+        samples=str(samples) if samples else None,
+        aligner=aligner, method=method, output_format=output_format,
+        salmon_index=str(salmon_index) if salmon_index else None,
+        star_index=str(star_index) if star_index else None,
+        bismark_genome=str(bismark_genome) if bismark_genome else None,
+        betas=str(betas) if betas else None,
+        metadata=str(metadata) if metadata else None,
+    )
+    if issues:
+        console.print(f"\n[bold red]✗ {len(issues)} problem(s) found:[/bold red]")
+        for x in issues:
+            console.print(f"  [red]•[/red] {x}")
+        console.print("\n[dim]Fix these and re-run [bold]upstream check[/bold], or run the track directly.[/dim]")
+        raise typer.Exit(1)
+    console.print(f"\n[bold green]✓ All checks passed[/bold green] — '{track}' is ready to run.")
 
 
 # ── Download ───────────────────────────────────────────────────────────────
