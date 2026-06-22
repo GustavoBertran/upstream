@@ -28,7 +28,7 @@ from rich.console import Console
 from rich.markdown import Markdown
 from rich.panel import Panel
 
-from . import checkpoints, downloader, obama, preflight, runner
+from . import __version__, checkpoints, downloader, obama, preflight, runner
 from .samplesheet import scan_fastq_dir
 
 app = typer.Typer(
@@ -38,6 +38,23 @@ app = typer.Typer(
     add_completion=False,
 )
 console = Console()
+
+
+def _version_callback(value: bool) -> None:
+    if value:
+        console.print(f"upstream {__version__}")
+        raise typer.Exit()
+
+
+@app.callback()
+def _main(
+    version: Annotated[bool, typer.Option(
+        "--version", help="Show the upstream version and exit.",
+        callback=_version_callback, is_eager=True,
+    )] = False,
+) -> None:
+    """upstream — HTS preprocessing pipeline (trim, align, quantify → matrices)."""
+
 
 # ── Types (shorthand for Annotated options) ──────────────────────────────
 

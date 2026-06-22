@@ -27,7 +27,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse, StreamingResponse
 from pydantic import BaseModel
 
-from . import preflight
+from . import __version__, preflight
 from .samplesheet import scan_fastq_dir
 
 _ANSI_RE = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]")
@@ -80,7 +80,7 @@ class RunRequest(BaseModel):
 
 @app.get("/", response_class=HTMLResponse)
 def index() -> str:
-    return _HTML
+    return _HTML.replace("{{VERSION}}", __version__)
 
 
 @app.post("/api/run")
@@ -731,7 +731,8 @@ input:checked+.slider::before{transform:translateX(14px)}
   </div>
   <div class="sidebar-footer">
     Pipeline runs on the server.<br>
-    Output streams here live.
+    Output streams here live.<br>
+    <span style="opacity:.65">upstream v{{VERSION}}</span>
   </div>
 </div>
 
