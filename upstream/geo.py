@@ -45,15 +45,15 @@ def fetch_series(gse: str) -> dict:
         raise ValueError(f"Could not retrieve summary for {gse}.")
 
     samples = [
-        {"gsm": s["Accession"], "title": s["Title"]}
-        for s in doc.get("Samples", [])
+        {"gsm": s["accession"], "title": s["title"]}
+        for s in doc.get("samples", [])
     ]
     return {
-        "gse":      gse,
-        "title":    doc.get("title", ""),
-        "organism": doc.get("taxon", ""),
-        "n_samples": len(samples),
-        "samples":  samples,
+        "gse":       gse,
+        "title":     doc.get("title", ""),
+        "organism":  doc.get("taxon", ""),
+        "n_samples": doc.get("n_samples", len(samples)),
+        "samples":   samples,
     }
 
 
