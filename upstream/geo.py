@@ -7,12 +7,19 @@ from __future__ import annotations
 
 import json
 import re
+import threading
 import time
 import urllib.request
 from typing import Optional
 
 _EUTILS = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils"
 _DELAY  = 0.4   # seconds between NCBI calls
+
+# Global rate-limiter: ensures no two threads call NCBI faster than 1/_DELAY req/s.
+# Without this, concurrent server threads each sleep 0.4 s in parallel and then
+# all hit NCBI at the same time, causing HTTP 429 rate-limit errors.
+_ncbi_lock = threading.Lock()
+_ncbi_last: float = 0.0
 
 
 def _lk(d: dict) -> dict:
@@ -21,8 +28,14 @@ def _lk(d: dict) -> dict:
 
 
 def _get(url: str) -> dict:
-    time.sleep(_DELAY)
-    with urllib.request.urlopen(url, timeout=20) as r:
+    global _ncbi_last
+    with _ncbi_lock:
+        now = time.monotonic()
+        gap = _ncbi_last + _DELAY - now
+        if gap > 0:
+            time.sleep(gap)
+        _ncbi_last = time.monotonic()
+    with urllib.request.urlopen(url, timeout=30) as r:
         return json.loads(r.read())
 
 
@@ -99,6 +112,62 @@ def fetch_srr(gsm: str) -> list[str]:
         srrs.extend(re.findall(r'acc="(SRR\d+)"', doc.get("runs", "")))
 
     return list(dict.fromkeys(srrs))  # deduplicate, preserve order
+
+
+def fetch_srr_all(gse: str) -> dict[str, str]:
+    """Return {gsm: first_srr} for every sample in a GEO series.
+
+    Uses series-level API calls instead of one call per sample:
+      esearch (1 call) → elink series→SRA (1 call) → batch esummary (1–3 calls)
+    versus the per-sample approach which needs N×3 calls for N samples.
+
+    The SRA esummary expxml field contains:
+      <Sample ... name="GSMxxxxxx" .../>
+    which is used to map each SRA experiment back to its GSM accession.
+    """
+    gse = gse.strip().upper()
+
+    # 1 — GDS series UID
+    result = _get(f"{_EUTILS}/esearch.fcgi?db=gds&term={gse}[ACCN]&retmode=json")
+    ids = result["esearchresult"]["idlist"]
+    if not ids:
+        return {}
+    series_id = next((i for i in ids if i.startswith("2")), ids[0])
+
+    # 2 — All SRA experiments linked to this series (single elink call)
+    result = _get(
+        f"{_EUTILS}/elink.fcgi?dbfrom=gds&db=sra&id={series_id}&retmode=json"
+    )
+    sra_ids: list[str] = []
+    for linkset in result.get("linksets", []):
+        for linksetdb in linkset.get("linksetdbs", []):
+            if linksetdb.get("dbto") == "sra":
+                sra_ids.extend(str(i) for i in linksetdb.get("links", []))
+    if not sra_ids:
+        return {}
+
+    # 3 — Batch esummary (200 IDs per call)
+    gsm_to_srr: dict[str, str] = {}
+    for start in range(0, len(sra_ids), 200):
+        chunk = sra_ids[start : start + 200]
+        result = _get(
+            f"{_EUTILS}/esummary.fcgi?db=sra&id={','.join(chunk)}&retmode=json"
+        )
+        for uid in chunk:
+            doc = result.get("result", {}).get(uid, {})
+            exp_xml = doc.get("expxml", "")
+            # GSM lives in <Sample ... name="GSMxxxxxx" ...> within expxml
+            m = re.search(r'<Sample[^>]+name="(GSM\d+)"', exp_xml, re.IGNORECASE)
+            if not m:
+                m = re.search(r'name="(GSM\d+)"', exp_xml, re.IGNORECASE)
+            if not m:
+                continue
+            gsm = m.group(1).upper()
+            srrs = re.findall(r'acc="(SRR\d+)"', doc.get("runs", ""))
+            if srrs and gsm not in gsm_to_srr:
+                gsm_to_srr[gsm] = srrs[0]
+
+    return gsm_to_srr
 
 
 def fetch_characteristics(gse: str) -> dict:

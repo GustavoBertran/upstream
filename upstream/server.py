@@ -278,6 +278,16 @@ def geo_srr(gsm: str) -> dict:
     return {"gsm": gsm, "srrs": geo.fetch_srr(gsm)}
 
 
+@app.get("/api/geo/srr-all/{gse}")
+def geo_srr_all(gse: str) -> dict:
+    """Return {gsm: first_srr} for all samples in a series via batch API calls."""
+    from . import geo
+    try:
+        return geo.fetch_srr_all(gse)
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+
 @app.get("/api/geo/char/{gse}")
 def geo_char(gse: str) -> dict:
     """Return sample characteristics from the GEO series matrix file."""
@@ -1101,27 +1111,27 @@ async function fetchGSE() {
       })
       .catch(function(){});  // characteristics unavailable — proceed without them
 
-    // Fetch SRRs concurrently
-    Promise.all(data.samples.map(function(s){
-      return fetch("/api/geo/srr/"+s.gsm)
-        .then(function(r){ return r.json(); })
-        .then(function(d){
-          var row = null;
-          for (var i = 0; i < _geoRows.length; i++) {
-            if (_geoRows[i].gsm === s.gsm) { row = _geoRows[i]; break; }
-          }
-          if (row) row.srr = (d.srrs && d.srrs.length) ? d.srrs[0] : "";
-          var td = document.getElementById("srr-"+s.gsm);
+    // Fetch all SRRs for the series in one batch call (esearch → elink → esummary)
+    // instead of one API call per sample — reduces N×3 NCBI calls to ~3 total.
+    fetch("/api/geo/srr-all/"+gse)
+      .then(function(r){ return r.json(); })
+      .then(function(srrMap){
+        for (var i = 0; i < _geoRows.length; i++) {
+          var row = _geoRows[i];
+          row.srr = srrMap[row.gsm] || "";
+          var td = document.getElementById("srr-"+row.gsm);
           if (td) {
-            if (d.srrs && d.srrs.length) {
-              td.textContent = d.srrs[0]; td.className = "srr-cell";
+            if (row.srr) {
+              td.textContent = row.srr; td.className = "srr-cell";
             } else {
               td.textContent = "not found"; td.className = "srr-err";
             }
           }
-          renderSummaryTable();
-        });
-    })).then(function(){ geoMsg(""); });
+        }
+        renderSummaryTable();
+        geoMsg("");
+      })
+      .catch(function(e){ geoMsg("SRR lookup failed: "+e.message); });
 
   } catch(e) {
     geoMsg("Network error: "+e.message);
