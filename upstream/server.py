@@ -668,11 +668,18 @@ function selectTrack(id) {
         return '<div class="field full"><label>'+i.label+'</label>' +
                '<div class="field-row">' +
                '<input type="text" id="inp-'+k+'" placeholder="'+i.ph+'">' +
-               '<button class="browse-btn" onclick="openBrowser(\'inp-'+k+'\',\'dir\')">...</button>' +
+               '<button class="browse-btn" data-inp="inp-'+k+'" data-btype="dir">...</button>' +
                '</div></div>';
       }).join("");
+      _wireBrowse(ef);
     }
   }
+}
+
+function _wireBrowse(el) {
+  el.querySelectorAll(".browse-btn[data-inp]").forEach(function(btn) {
+    btn.onclick = function() { openBrowser(btn.dataset.inp, btn.dataset.btype || "any"); };
+  });
 }
 
 function updateAlignerField() {
@@ -683,15 +690,16 @@ function updateAlignerField() {
     div.innerHTML = '<label>Salmon index directory</label>' +
       '<div class="field-row">' +
         '<input type="text" id="inp-salmon-index" placeholder="'+EXTRA_INFO["salmon-index"].ph+'">' +
-        '<button class="browse-btn" onclick="openBrowser(\'inp-salmon-index\',\'dir\')">...</button>' +
+        '<button class="browse-btn" data-inp="inp-salmon-index" data-btype="dir">...</button>' +
       '</div>';
   } else {
     div.innerHTML = '<label>STAR index directory</label>' +
       '<div class="field-row">' +
         '<input type="text" id="inp-star-index" placeholder="'+EXTRA_INFO["star-index"].ph+'">' +
-        '<button class="browse-btn" onclick="openBrowser(\'inp-star-index\',\'dir\')">...</button>' +
+        '<button class="browse-btn" data-inp="inp-star-index" data-btype="dir">...</button>' +
       '</div>';
   }
+  _wireBrowse(div);
 }
 
 function updateMethylationMethod() {
@@ -704,17 +712,17 @@ function updateMethylationMethod() {
     if (samplesRow) samplesRow.style.display = "none";
     div.innerHTML =
       '<div class="field full">' +
-        '<label>Beta matrix CSV — probes as rows, GSM accessions as columns (GEO supplementary format)</label>' +
+        '<label>Beta matrix CSV (probes as rows, GSM accessions as columns)</label>' +
         '<div class="field-row">' +
           '<input type="text" id="inp-betas" placeholder="/data/GSE59685_betas.csv">' +
-          '<button class="browse-btn" onclick="openBrowser(\'inp-betas\',\'file\')">...</button>' +
+          '<button class="browse-btn" data-inp="inp-betas" data-btype="file">...</button>' +
         '</div>' +
       '</div>' +
       '<div class="field full">' +
-        '<label>Metadata CSV — must have geo_accession and disease.state columns</label>' +
+        '<label>Metadata CSV (geo_accession and disease.state columns)</label>' +
         '<div class="field-row">' +
           '<input type="text" id="inp-metadata-csv" placeholder="/data/metadata.csv">' +
-          '<button class="browse-btn" onclick="openBrowser(\'inp-metadata-csv\',\'file\')">...</button>' +
+          '<button class="browse-btn" data-inp="inp-metadata-csv" data-btype="file">...</button>' +
         '</div>' +
       '</div>';
   } else {
@@ -724,10 +732,11 @@ function updateMethylationMethod() {
         '<label>Bismark genome directory</label>' +
         '<div class="field-row">' +
           '<input type="text" id="inp-bismark-genome" placeholder="'+EXTRA_INFO["bismark-genome"].ph+'">' +
-          '<button class="browse-btn" onclick="openBrowser(\'inp-bismark-genome\',\'dir\')">...</button>' +
+          '<button class="browse-btn" data-inp="inp-bismark-genome" data-btype="dir">...</button>' +
         '</div>' +
       '</div>';
   }
+  _wireBrowse(div);
 }
 
 // ── GEO download ──────────────────────────────────────────────────────────

@@ -33,6 +33,32 @@ upstream --help
 
 ---
 
+## Web Interface
+
+`upstream` includes a browser-based UI that lets you run pipelines without typing commands.
+Launch it with:
+
+```bash
+upstream serve
+```
+
+Then open **http://localhost:8421** in your browser.
+
+The interface lets you:
+- **Browse** your filesystem to fill in file/folder paths (click the `...` button next to any input)
+- **Select a track** in the sidebar (RNA-seq, ATAC-seq, Methylation, QC, Download Data)
+- **Stream output** live as the pipeline runs
+- **Download GEO data** — type a GSE accession, assign disease/control groups, and download FASTQ files with one click
+- **Process 450K/EPIC methylation arrays** — select "Methylation → 450K / EPIC array (GEO beta matrix)" and provide a beta-value CSV + metadata CSV directly
+
+To use a different port:
+
+```bash
+upstream serve --port 9000
+```
+
+---
+
 ## Quickstart
 
 ### 1. Create a samplesheet
@@ -55,12 +81,21 @@ upstream qc \
   --outdir results/qc/
 ```
 
-**RNA-seq:**
+**RNA-seq (Salmon, alignment-free — default):**
 ```bash
 upstream rnaseq \
   --samples samples.csv \
-  --star-index   /path/to/star_hg38 \
+  --aligner salmon \
   --salmon-index /path/to/salmon_hg38 \
+  --outdir results/rnaseq/
+```
+
+**RNA-seq (STAR, genome alignment + gene counts):**
+```bash
+upstream rnaseq \
+  --samples samples.csv \
+  --aligner star \
+  --star-index /path/to/star_hg38 \
   --outdir results/rnaseq/
 ```
 
@@ -72,13 +107,30 @@ upstream atacseq \
   --outdir results/atacseq/
 ```
 
-**DNA Methylation (WGBS/RRBS):**
+**DNA Methylation — WGBS (Bismark pipeline):**
 ```bash
 upstream methylation \
+  --method wgbs \
   --samples samples.csv \
   --bismark-genome /path/to/bismark_hg38 \
   --outdir results/methylation/
 ```
+
+**DNA Methylation — Illumina array (450K / EPIC, from GEO):**
+
+No FASTQ files needed — provide the beta-value matrix downloaded from GEO
+and a metadata CSV with `geo_accession` and `disease.state` columns:
+
+```bash
+upstream methylation \
+  --method array \
+  --betas /data/GSE59685_betas.csv \
+  --metadata /data/meta_GSE59685.csv \
+  --outdir results/methylation/
+```
+
+The beta matrix should have probe IDs (e.g. `cg00000029`) as rows and GSM
+accession IDs as columns — the standard format for GEO supplementary files.
 
 ---
 
