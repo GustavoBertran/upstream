@@ -77,7 +77,8 @@ def index() -> str:
 def start_run(req: RunRequest) -> dict:
     run_id = uuid.uuid4().hex[:8]
     with _runs_lock:
-        _runs[run_id] = {"status": "running", "lines": [], "proc": None, "exit_code": None}
+        _runs[run_id] = {"status": "running", "lines": [], "proc": None,
+                         "procs": set(), "exit_code": None}
     threading.Thread(target=_run_pipeline, args=(run_id, req), daemon=True).start()
     return {"run_id": run_id}
 
@@ -91,11 +92,20 @@ def stream(run_id: str) -> StreamingResponse:
 
 @app.post("/api/cancel/{run_id}")
 def cancel(run_id: str) -> dict:
+    procs = []
     with _runs_lock:
         run = _runs.get(run_id)
-    if run and run["proc"] and run["status"] == "running":
-        run["proc"].terminate()
-        run["status"] = "cancelled"
+        if run and run["status"] == "running":
+            run["status"] = "cancelled"
+            if run.get("proc"):
+                procs.append(run["proc"])
+            procs.extend(run.get("procs", ()))
+    # terminate() outside the lock — it can block briefly
+    for p in procs:
+        try:
+            p.terminate()
+        except Exception:
+            pass
     return {"ok": True}
 
 
@@ -173,66 +183,165 @@ def _run_pipeline(run_id: str, req: RunRequest) -> None:
 
 
 def _run_geo_download(run_id: str, req: RunRequest) -> None:
+    """Download selected GEO samples as subsampled FASTQ, then write samples.csv.
+
+    Faster, more robust path than bare `fasterq-dump`:
+      prefetch SRR (cloud mirror)  →  fasterq-dump on the local .sra  →  seqtk
+    `prefetch` pulls from the AWS/GCP SRA mirrors and avoids the NCBI streaming
+    throttling that bare `fasterq-dump` hits.  Samples download concurrently.
+    Library layout (paired vs single) is detected from the extracted FASTQ.
+    """
     import csv as _csv
-    run   = _runs[run_id]
-    outdir = Path(req.outdir)
+    import concurrent.futures as _futures
+
+    run     = _runs[run_id]
+    outdir  = Path(req.outdir)
     outdir.mkdir(parents=True, exist_ok=True)
     samples = req.geo_samples or []
+    nreads  = 1_000_000
+    workers = min(4, len(samples)) or 1
 
     def append(text: str, cls: str = "out") -> None:
         with _runs_lock:
             run["lines"].append({"text": text, "cls": cls})
 
-    def run_cmd(cmd: list[str]) -> int:
-        append("$ " + " ".join(str(c) for c in cmd), "cmd")
+    def cancelled() -> bool:
+        with _runs_lock:
+            return run["status"] == "cancelled"
+
+    missing = [t for t in ("prefetch", "fasterq-dump", "seqtk") if shutil.which(t) is None]
+    if missing:
+        append(f"✗ Required tool(s) not found on PATH: {', '.join(missing)}. "
+               f"Activate the environment (conda activate upstream) and retry.", "error")
+        with _runs_lock:
+            run["status"] = "error"; run["exit_code"] = 1
+        return
+
+    def spawn(cmd: list[str], tag: str) -> int:
+        """Run a subprocess, prefixing output with *tag* (samples run concurrently)."""
         proc = subprocess.Popen(
             [str(c) for c in cmd],
-            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            text=True, bufsize=1,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1,
         )
-        run["proc"] = proc
-        for raw in proc.stdout:
-            t = _ANSI_RE.sub("", raw).rstrip()
-            if t:
-                append(t)
-        proc.wait()
+        with _runs_lock:
+            run["procs"].add(proc)
+        try:
+            for raw in proc.stdout:
+                t = _ANSI_RE.sub("", raw).rstrip()
+                if t:
+                    append(f"  [{tag}] {t}")
+            proc.wait()
+        finally:
+            with _runs_lock:
+                run["procs"].discard(proc)
         return proc.returncode
 
-    csv_rows = []
-    for i, s in enumerate(samples):
-        srr, name, group = s["srr"], s["name"], s["group"]
-        append(f"── {i+1}/{len(samples)}  {name} ({group})  SRR: {srr}", "step")
+    def find_sra(base: Path, srr: str) -> Optional[Path]:
+        for cand in (base / srr / f"{srr}.sra", base / f"{srr}.sra", base / srr / srr):
+            if cand.exists():
+                return cand
+        hits = list(base.glob(f"{srr}*/*.sra")) + list(base.glob(f"{srr}*.sra"))
+        return hits[0] if hits else None
 
+    def subsample(src: Path, dest: Path) -> bool:
+        p1 = subprocess.Popen(["seqtk", "sample", "-s", "42", str(src), str(nreads)],
+                              stdout=subprocess.PIPE)
+        with dest.open("wb") as fh:
+            p2 = subprocess.Popen(["gzip"], stdin=p1.stdout, stdout=fh)
+        p1.stdout.close(); p2.wait(); p1.wait()
+        return p2.returncode == 0 and p1.returncode == 0
+
+    def do_sample(s: dict) -> dict:
+        srr, name, group = s["srr"], s["name"], s["group"]
         r1 = outdir / f"{name}_R1.fastq.gz"
         r2 = outdir / f"{name}_R2.fastq.gz"
+        base = {"name": name, "group": group}
 
-        if r1.exists() and r2.exists():
-            append(f"✓ {name}: files already present, skipping download.", "ok")
-        else:
-            rc = run_cmd(["fasterq-dump", "--split-files", "--outdir", str(outdir), "--progress", srr])
-            if rc != 0:
-                append(f"✗ fasterq-dump failed for {srr}.", "error")
-                run["status"] = "error"; run["exit_code"] = rc; return
+        if r1.exists():
+            layout = "paired" if r2.exists() else "single"
+            append(f"[{name}] files already present, skipping ({layout}).", "ok")
+            return {**base, "r1": r1, "r2": (r2 if r2.exists() else None), "ok": True}
+        if cancelled():
+            return {**base, "ok": False}
 
-            append(f"  Subsampling {name} to 1,000,000 reads…")
-            for suffix, dest in [(f"{srr}_1.fastq", r1), (f"{srr}_2.fastq", r2)]:
-                src = outdir / suffix
-                p1 = subprocess.Popen(
-                    ["seqtk", "sample", "-s", "42", str(src), "1000000"],
-                    stdout=subprocess.PIPE,
-                )
-                with dest.open("wb") as fh:
-                    p2 = subprocess.Popen(["gzip"], stdin=p1.stdout, stdout=fh)
-                p1.stdout.close(); p2.wait(); p1.wait()
-                src.unlink(missing_ok=True)
-                if p2.returncode != 0:
-                    append("✗ seqtk/gzip failed.", "error")
-                    run["status"] = "error"; run["exit_code"] = 1; return
+        sra_dir = outdir / f".sra_{srr}"
+        try:
+            # 1 — prefetch the run from the cloud mirror
+            append(f"[{name}] prefetch {srr} (cloud mirror)…")
+            if spawn(["prefetch", srr, "-O", str(sra_dir), "--max-size", "100g"], name) != 0:
+                if not cancelled():
+                    append(f"[{name}] ✗ prefetch failed.", "error")
+                return {**base, "ok": False}
+            if cancelled():
+                return {**base, "ok": False}
+            sra = find_sra(sra_dir, srr)
+            if sra is None:
+                append(f"[{name}] ✗ prefetch produced no .sra file.", "error")
+                return {**base, "ok": False}
 
-            append(f"✓ {name} ready.", "ok")
+            # 2 — extract locally (no network); layout detected from output files
+            append(f"[{name}] extracting reads…")
+            if spawn(["fasterq-dump", str(sra), "--split-files",
+                      "--outdir", str(sra_dir)], name) != 0:
+                if not cancelled():
+                    append(f"[{name}] ✗ fasterq-dump failed.", "error")
+                return {**base, "ok": False}
+            if cancelled():
+                return {**base, "ok": False}
 
-        csv_rows.append({"name": name, "group": group,
-                         "r1": str(r1.resolve()), "r2": str(r2.resolve())})
+            f1, f2 = sra_dir / f"{srr}_1.fastq", sra_dir / f"{srr}_2.fastq"
+            f0 = sra_dir / f"{srr}.fastq"
+            if f1.exists() and f2.exists():
+                layout, jobs = "paired", [(f1, r1), (f2, r2)]
+            elif f0.exists():
+                layout, jobs = "single", [(f0, r1)]
+            else:
+                append(f"[{name}] ✗ no FASTQ produced by fasterq-dump.", "error")
+                return {**base, "ok": False}
+
+            # 3 — subsample + compress
+            append(f"[{name}] subsampling to {nreads:,} reads ({layout})…")
+            for src, dest in jobs:
+                if cancelled():
+                    return {**base, "ok": False}
+                if not subsample(src, dest):
+                    dest.unlink(missing_ok=True)
+                    append(f"[{name}] ✗ seqtk/gzip failed.", "error")
+                    return {**base, "ok": False}
+
+            append(f"[{name}] ✓ ready ({layout}).", "ok")
+            return {**base, "r1": r1, "r2": (r2 if layout == "paired" else None), "ok": True}
+        except Exception as e:                       # noqa: BLE001 — surface, don't crash the run
+            append(f"[{name}] ✗ {e}", "error")
+            return {**base, "ok": False}
+        finally:
+            shutil.rmtree(sra_dir, ignore_errors=True)
+
+    append(f"Downloading {len(samples)} sample(s), {workers} in parallel "
+           f"(prefetch → fasterq-dump → subsample)…", "step")
+
+    results: list[dict] = []
+    with _futures.ThreadPoolExecutor(max_workers=workers) as ex:
+        results = list(ex.map(do_sample, samples))
+
+    if cancelled():
+        append("Run cancelled.", "error")
+        with _runs_lock:
+            run["exit_code"] = 1
+        return
+
+    failed = [r["name"] for r in results if not r.get("ok")]
+    if failed:
+        append(f"✗ Failed: {', '.join(failed)}. No samplesheet written.", "error")
+        with _runs_lock:
+            run["status"] = "error"; run["exit_code"] = 1
+        return
+
+    has_single = any(not r.get("r2") for r in results)
+    csv_rows = [{"name": r["name"], "group": r["group"],
+                 "r1": str(Path(r["r1"]).resolve()),
+                 "r2": (str(Path(r["r2"]).resolve()) if r.get("r2") else "")}
+                for r in results]
 
     csv_path = outdir / "samples.csv"
     with csv_path.open("w", newline="") as f:
@@ -240,9 +349,14 @@ def _run_geo_download(run_id: str, req: RunRequest) -> None:
         w.writeheader(); w.writerows(csv_rows)
 
     append(f"✓ samples.csv written → {csv_path}", "ok")
+    if has_single:
+        append("Note: single-end sample(s) were written with an empty r2 column. "
+               "The pipeline tracks currently assume paired-end input — running them "
+               "on single-end data is a separate step.", "out")
     append("Done. Run the pipeline with:", "success")
     append(f"  upstream rnaseq --samples {csv_path} --outdir results/", "cmd")
-    run["status"] = "done"; run["exit_code"] = 0
+    with _runs_lock:
+        run["status"] = "done"; run["exit_code"] = 0
 
 
 def _classify(text: str) -> str:
@@ -1307,7 +1421,7 @@ async function startGeoDownload() {
   await _kickoffRun(
     {track:"download_geo", outdir:outdir, geo_samples:geoSamples},
     "Download Data",
-    geoSamples.length
+    1   // samples download in parallel — one timed batch step
   );
 }
 
@@ -1547,7 +1661,7 @@ function _fmtElapsed(ms) {
 // input; on subsampled teaching data the live timer will read much lower.
 function _typicalFor(text) {
   var t = text.toLowerCase();
-  if (/srr:/.test(t))                 return "~1-5 min/sample (network-dependent)";
+  if (/downloading|prefetch|srr:/.test(t)) return "depends on run size & bandwidth";
   if (/multiqc/.test(t))              return "~10-40 s";
   if (/fastqc/.test(t))               return "~30 s-2 min";
   if (/bismark/.test(t))              return "~10-40 min";
