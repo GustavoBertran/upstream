@@ -156,10 +156,10 @@ def fetch_srr_all(gse: str) -> dict[str, str]:
         for uid in chunk:
             doc = result.get("result", {}).get(uid, {})
             exp_xml = doc.get("expxml", "")
-            # GSM lives in <Sample ... name="GSMxxxxxx" ...> within expxml
-            m = re.search(r'<Sample[^>]+name="(GSM\d+)"', exp_xml, re.IGNORECASE)
-            if not m:
-                m = re.search(r'name="(GSM\d+)"', exp_xml, re.IGNORECASE)
+            # GSM accession appears in <Title>GSMxxxxxx: ...</Title> and/or
+            # <Experiment name="GSMxxxxxx: ..."/>; <Sample name=""> is often empty.
+            # Grab the first GSM\d+ token anywhere in expxml.
+            m = re.search(r"(GSM\d+)", exp_xml, re.IGNORECASE)
             if not m:
                 continue
             gsm = m.group(1).upper()
