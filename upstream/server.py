@@ -440,6 +440,12 @@ input:checked+.slider::before{transform:translateX(14px)}
 .dot.done{background:var(--green)}
 .dot.active{background:var(--accent)}
 .dot.err{background:var(--red)}
+.steps-legend{font-size:.66rem;color:var(--dim);margin-top:.3rem}
+/* per-step timing */
+.step-time{font-weight:normal;color:var(--bright);margin-left:.6rem;font-size:.72rem}
+.step-time.running{color:var(--accent)}
+.step-typical{color:var(--dim);font-size:.68rem;font-weight:normal;
+              margin:.05rem 0 .15rem 1.4rem}
 .log{flex:1;background:var(--bg2);border:1px solid var(--border);border-radius:6px;
      font-family:monospace;font-size:.775rem;overflow-y:auto;padding:.875rem;
      line-height:1.65;min-height:0}
@@ -697,6 +703,9 @@ input:checked+.slider::before{transform:translateX(14px)}
       <div>
         <h2 id="log-title"></h2>
         <div class="steps" id="steps-row"></div>
+        <div class="steps-legend" id="steps-legend" style="display:none">
+          &#9201; live elapsed per step &middot; <em>typical</em> ranges are rough and assume full-size input
+        </div>
       </div>
       <div class="actions">
         <button class="btn ghost" id="btn-newrun" onclick="newRun()" style="display:none">New run</button>
@@ -1373,6 +1382,7 @@ async function _kickoffRun(body, label, nsteps) {
   document.getElementById("btn-stop").style.display = "";
   document.getElementById("btn-newrun").style.display = "none";
 
+  _clearStepTimer();
   stepIdx = 0;
   const sr = document.getElementById("steps-row");
   sr.innerHTML = "";
@@ -1381,6 +1391,7 @@ async function _kickoffRun(body, label, nsteps) {
     d.className = "dot"+(i===0?" active":""); d.id = "dot-"+i;
     sr.appendChild(d);
   }
+  document.getElementById("steps-legend").style.display = "";
 
   const res = await fetch("/api/run", {
     method:"POST", headers:{"Content-Type":"application/json"},
@@ -1394,6 +1405,7 @@ async function _kickoffRun(body, label, nsteps) {
     const d = JSON.parse(e.data);
     if (d.done) {
       sse.close(); runId = null;
+      _clearStepTimer();
       const ok = d.exit_code === 0;
       document.getElementById("log-status").innerHTML = ok
         ? '<span style="color:var(--green)">✓ Complete</span>'
@@ -1413,8 +1425,9 @@ async function _kickoffRun(body, label, nsteps) {
       }
       return;
     }
-    appendLine(d.text, d.cls);
+    const lineDiv = appendLine(d.text, d.cls);
     if (d.cls==="step") {
+      _startStepTimer(lineDiv, d.text);
       const cur = document.getElementById("dot-"+stepIdx);
       if (cur) { cur.classList.remove("active"); cur.classList.add("done"); }
       stepIdx = Math.min(stepIdx+1, _runNsteps-1);
@@ -1424,6 +1437,7 @@ async function _kickoffRun(body, label, nsteps) {
   };
   sse.onerror = function() {
     if (runId) {
+      _clearStepTimer();
       appendLine("⚠ Connection lost. Check your outdir for results.", "error");
       document.getElementById("log-status").innerHTML =
         '<span style="color:var(--yellow)">Connection lost</span>';
@@ -1512,12 +1526,81 @@ function appendLine(text, cls) {
   const div = document.createElement("div");
   div.className = "ll "+(cls||"out"); div.textContent = text;
   log.appendChild(div); log.scrollTop = log.scrollHeight;
+  return div;
+}
+
+// ── Per-step timing ───────────────────────────────────────────────────────
+// Each "step" SSE line starts a new timed segment; the previous one is frozen.
+// The live clock is ground truth; "typical" is a rough keyword-based hint.
+var _stepTimerInterval = null;
+var _stepStartMs       = 0;
+var _curStepTimeEl     = null;
+
+function _fmtElapsed(ms) {
+  var s = Math.floor(ms / 1000);
+  var m = Math.floor(s / 60);
+  var ss = s % 60;
+  return (m < 10 ? "0" : "") + m + ":" + (ss < 10 ? "0" : "") + ss;
+}
+
+// Rough typical durations, keyed by what the step does. Assumes full-size
+// input; on subsampled teaching data the live timer will read much lower.
+function _typicalFor(text) {
+  var t = text.toLowerCase();
+  if (/srr:/.test(t))                 return "~1-5 min/sample (network-dependent)";
+  if (/multiqc/.test(t))              return "~10-40 s";
+  if (/fastqc/.test(t))               return "~30 s-2 min";
+  if (/bismark/.test(t))              return "~10-40 min";
+  if (/\\bstar\\b/.test(t))           return "~3-10 min";
+  if (/bowtie/.test(t))               return "~3-10 min";
+  if (/salmon|quantif/.test(t))       return "~2-8 min";
+  if (/macs2|peak/.test(t))           return "~1-5 min";
+  if (/extract/.test(t))              return "~5-20 min";
+  if (/filter/.test(t))               return "~1-4 min";
+  if (/fastp|trim/.test(t))           return "~30 s-2 min";
+  if (/obama|matrix/.test(t))         return "~10-60 s";
+  return null;
+}
+
+function _clearStepTimer() {
+  if (_stepTimerInterval) { clearInterval(_stepTimerInterval); _stepTimerInterval = null; }
+  if (_curStepTimeEl) {
+    // Freeze from the start timestamp (not the last tick) so it is exact.
+    _curStepTimeEl.textContent = "\\u23f1 " + _fmtElapsed(Date.now() - _stepStartMs);
+    _curStepTimeEl.classList.remove("running");
+    _curStepTimeEl = null;
+  }
+}
+
+function _startStepTimer(stepDiv, text) {
+  _clearStepTimer();                       // freeze the previous step first
+  _stepStartMs = Date.now();
+
+  var timeEl = document.createElement("span");
+  timeEl.className = "step-time running";
+  timeEl.textContent = "\\u23f1 00:00";
+  stepDiv.appendChild(timeEl);
+  _curStepTimeEl = timeEl;
+
+  var typical = _typicalFor(text);
+  if (typical) {
+    var t = document.createElement("div");
+    t.className = "step-typical";
+    t.textContent = "typical: " + typical;
+    stepDiv.parentNode.insertBefore(t, stepDiv.nextSibling);
+  }
+
+  _stepTimerInterval = setInterval(function(){
+    if (!_curStepTimeEl) return;
+    _curStepTimeEl.textContent = "\\u23f1 " + _fmtElapsed(Date.now() - _stepStartMs);
+  }, 1000);
 }
 
 async function stopRun() {
   if (!runId) return;
   await fetch("/api/cancel/"+runId, {method:"POST"});
   if (sse) sse.close();
+  _clearStepTimer();
   appendLine("Run cancelled.", "error");
   document.getElementById("log-status").innerHTML =
     '<span style="color:var(--yellow)">Cancelled</span>';
@@ -1527,6 +1610,7 @@ async function stopRun() {
 }
 
 function newRun() {
+  _clearStepTimer();
   document.getElementById("log-panel").style.display = "none";
   document.getElementById("setup-panel").style.display = "";
 }
