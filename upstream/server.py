@@ -636,7 +636,7 @@ function selectTrack(id) {
 
   document.getElementById("standard-grid").style.display = isDownload ? "none" : "";
   document.getElementById("run-actions").style.display   = isDownload ? "none" : "";
-  document.getElementById("geo-panel").style.display     = isDownload ? "" : "none";
+  document.getElementById("geo-panel").style.display     = isDownload ? "block" : "none";
 
   if (!isDownload) {
     const ef = document.getElementById("extra-fields");
