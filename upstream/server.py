@@ -162,7 +162,7 @@ def _build_cmd(req: RunRequest) -> list[str]:
         cmd += ["--bowtie2-index", req.bowtie2_index]
     if req.bismark_genome:
         cmd += ["--bismark-genome", req.bismark_genome]
-    if req.output_format and req.track in ("rnaseq", "methylation"):
+    if req.output_format and req.track in ("rnaseq", "methylation", "atacseq"):
         cmd += ["--format", req.output_format]
     if req.track == "rnaseq":
         if req.gtf:
@@ -848,7 +848,7 @@ input:checked+.slider::before{transform:translateX(14px)}
 <script>
 const TRACKS = {
   rnaseq:      {label:"RNA-seq",      desc:"fastp → STAR or Salmon → counts matrix (OBAMA / DESeq2)", nsteps:3, isRnaseq:true},
-  atacseq:     {label:"ATAC-seq",     desc:"fastp → Bowtie2 → filter → MACS2 → matrix",  nsteps:5, extra:["bowtie2-index"]},
+  atacseq:     {label:"ATAC-seq",     desc:"fastp → Bowtie2 → filter → MACS2 → matrix (OBAMA / DESeq2)", nsteps:5, extra:["bowtie2-index"]},
   methylation: {label:"Methylation",  desc:"WGBS (Bismark) or 450K/EPIC array (GEO beta matrix)",nsteps:4, isMethylation:true},
   qc:          {label:"QC",           desc:"FastQC + MultiQC",                                    nsteps:2, extra:[]},
   download:    {label:"Download Data",desc:"Browse GEO, pick conditions, fasterq-dump",          isDownload:true},
@@ -942,6 +942,17 @@ function selectTrack(id) {
                '<button class="browse-btn" data-inp="inp-'+k+'" data-btype="dir">...</button>' +
                '</div></div>';
       }).join("");
+      if (id === "atacseq") {
+        ef.innerHTML +=
+          '<div class="field full">' +
+            '<label>Output format</label>' +
+            '<select id="inp-format">' +
+              '<option value="obama">OBAMA matrix (samples × peaks)</option>' +
+              '<option value="matrix">DESeq2 / edgeR — consensus-peak counts + coldata</option>' +
+              '<option value="both">Both</option>' +
+            '</select>' +
+          '</div>';
+      }
       _wireBrowse(ef);
     }
   }
@@ -1539,6 +1550,9 @@ async function startRun() {
       const v  = el ? el.value.trim() : "";
       if (!v) { err(EXTRA_INFO[k].label+" is required."); return; }
       body[k.split("-").join("_")] = v;
+    }
+    if (track === "atacseq") {
+      body.output_format = (document.getElementById("inp-format") || {value:"obama"}).value;
     }
   }
 

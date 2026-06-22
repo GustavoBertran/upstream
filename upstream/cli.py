@@ -363,10 +363,23 @@ def atacseq(
     samples: SamplesOpt,
     bowtie2_index: Annotated[Path, typer.Option("--bowtie2-index", help="Bowtie2 index prefix (path/to/hg38)")],
     outdir: OutdirOpt,
+    output_format: Annotated[str, typer.Option(
+        "--format",
+        help="Output: 'obama' (default), 'matrix' (counts_matrix.csv + coldata.csv — reads "
+             "counted in a consensus peak set, for DESeq2/edgeR), or 'both'.",
+    )] = "obama",
     threads: ThreadsOpt = 4,
     explain: ExplainOpt = True,
 ) -> None:
-    """ATAC-seq: QC → trim (fastp) → align (Bowtie2) → filter → peaks (MACS2) → OBAMA matrix."""
+    """ATAC-seq: QC → trim (fastp) → align (Bowtie2) → filter → peaks (MACS2) → matrix.
+
+    Default output is the OBAMA matrix (MACS2 peak scores). --format matrix (or both)
+    instead builds a consensus peak set across samples and counts reads per peak with
+    deeptools multiBamSummary, producing a peak × sample raw-count matrix + coldata for
+    DESeq2/edgeR differential accessibility.
+    """
+    if output_format not in ("obama", "matrix", "both"):
+        _die("--format must be 'obama', 'matrix', or 'both'.")
     sample_list = _read_samplesheet(samples)
     bt2_prefix = bowtie2_index  # e.g. /ref/bowtie2/hg38 (no .bt2 extension)
     outdir.mkdir(parents=True, exist_ok=True)
@@ -374,7 +387,8 @@ def atacseq(
     TOTAL = 5
     console.print(f"\n[bold]ATAC-seq pipeline[/bold] — {len(sample_list)} sample(s) → {outdir}\n")
 
-    peak_files: list[tuple[str, str, Path]] = []
+    # (name, group, peak_file, filtered_bam) per sample
+    atac_results: list[tuple[str, str, Path, Path]] = []
 
     for s in sample_list:
         name, group = s["name"], s["group"]
@@ -467,15 +481,50 @@ def atacseq(
         peak_file = peaks_dir / f"{name}_peaks.narrowPeak"
         _check(*checkpoints.check_macs2_peaks(peak_file))
 
-        peak_files.append((name, group, peak_file))
+        atac_results.append((name, group, peak_file, bam_final))
 
-    # 5 — OBAMA matrix
-    runner.step_header("OBAMA matrix", 5, TOTAL)
-    matrix_path = outdir / "obama_matrix.csv"
-    obama.build_atacseq(peak_files, matrix_path)
-    _check(*checkpoints.check_obama_format(matrix_path))
+    # 5 — Build output matrices
+    runner.step_header("Build matrix output", 5, TOTAL)
+    written: list[Path] = []
 
-    console.print(f"\n[bold green]Done.[/bold green] OBAMA matrix → {matrix_path}")
+    if output_format in ("obama", "both"):
+        obama_path = outdir / "obama_matrix.csv"
+        obama.build_atacseq([(n, g, pf) for n, g, pf, _b in atac_results], obama_path)
+        _check(*checkpoints.check_obama_format(obama_path))
+        written.append(obama_path)
+
+    if output_format in ("matrix", "both"):
+        if explain:
+            _explain("atacseq_export_formats.md")
+        # Consensus peak set (merge of all samples' peaks), then count reads per peak.
+        consensus_bed = outdir / "consensus_peaks.bed"
+        n_peaks = obama.build_atac_consensus([r[2] for r in atac_results], consensus_bed)
+        console.print(f"  Consensus peak set: {n_peaks:,} merged regions → {consensus_bed.name}")
+
+        raw = outdir / "_multibamsummary_raw.tab"
+        npz = outdir / "_multibamsummary.npz"
+        rc = runner.run([
+            "multiBamSummary", "BED-file",
+            "--BED",       str(consensus_bed),
+            "--bamfiles",  *[str(r[3]) for r in atac_results],
+            "--labels",    *[r[0] for r in atac_results],
+            "-p",          str(threads),
+            "--outRawCounts", str(raw),
+            "-o",          str(npz),
+        ])
+        if rc != 0:
+            _die("multiBamSummary (deeptools) failed — are the filtered BAMs indexed?")
+        counts_path = outdir / "counts_matrix.csv"
+        coldata_path = outdir / "coldata.csv"
+        obama.build_atac_counts_matrix(
+            raw, [(n, g) for n, g, _pf, _b in atac_results], counts_path, coldata_path,
+        )
+        npz.unlink(missing_ok=True)
+        raw.unlink(missing_ok=True)
+        _check(*checkpoints.check_counts_matrix(counts_path, coldata_path))
+        written += [counts_path, coldata_path]
+
+    console.print(f"\n[bold green]Done.[/bold green] Wrote: {', '.join(p.name for p in written)} → {outdir}")
 
 
 # ── Methylation ────────────────────────────────────────────────────────────

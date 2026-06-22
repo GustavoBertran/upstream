@@ -122,6 +122,12 @@ upstream atacseq \
   --outdir results/atacseq/
 ```
 
+With `--format matrix` (or `both`), ATAC-seq builds a consensus peak set across
+samples and counts reads per peak (deeptools `multiBamSummary`), writing a
+`counts_matrix.csv` (peaks × samples) + `coldata.csv` for **DESeq2/edgeR**
+differential accessibility — instead of the default MACS2-score OBAMA matrix
+(the score isn't a count). See `content/atacseq_export_formats.md`.
+
 **DNA Methylation — WGBS (Bismark pipeline):**
 ```bash
 upstream methylation \

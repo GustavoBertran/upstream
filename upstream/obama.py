@@ -507,6 +507,78 @@ def write_methylation_array_outputs(
     return written
 
 
+def build_atac_consensus(peak_files: list[Path], out_bed: Path) -> int:
+    """Merge all samples' narrowPeak intervals into a consensus BED; return n regions.
+
+    Overlapping/abutting peaks across samples are merged per chromosome so every
+    sample is counted over the same feature set (the input DESeq2/edgeR need).
+    """
+    intervals: dict[str, list[tuple[int, int]]] = {}
+    for pf in peak_files:
+        for line in Path(pf).read_text().splitlines():
+            if not line.strip():
+                continue
+            p = line.split("\t")
+            if len(p) < 3:
+                continue
+            try:
+                start, end = int(p[1]), int(p[2])
+            except ValueError:
+                continue
+            intervals.setdefault(p[0], []).append((start, end))
+
+    merged: list[tuple[str, int, int]] = []
+    for chrom in sorted(intervals):
+        ivs = sorted(intervals[chrom])
+        cs, ce = ivs[0]
+        for s, e in ivs[1:]:
+            if s <= ce:                 # overlap or touch → extend
+                ce = max(ce, e)
+            else:
+                merged.append((chrom, cs, ce))
+                cs, ce = s, e
+        merged.append((chrom, cs, ce))
+
+    with out_bed.open("w") as f:
+        for i, (chrom, s, e) in enumerate(merged, 1):
+            f.write(f"{chrom}\t{s}\t{e}\tpeak_{i}\n")
+    return len(merged)
+
+
+def build_atac_counts_matrix(
+    raw_counts_path: Path,
+    samples: list[tuple[str, str]],   # (name, group) in --labels order
+    counts_path: Path,
+    coldata_path: Path,
+) -> None:
+    """Convert deeptools multiBamSummary --outRawCounts into counts_matrix + coldata.
+
+    multiBamSummary preserves --bamfiles/--labels order, so count columns 4..N map
+    positionally to `samples`. Counts are rounded to integers for DESeq2/edgeR.
+    """
+    lines = [l for l in raw_counts_path.read_text().splitlines() if l.strip()]
+    if len(lines) < 2:
+        raise ValueError("multiBamSummary produced no count rows.")
+    n_data = len(lines[0].split("\t")) - 3
+    if n_data != len(samples):
+        raise ValueError(
+            f"multiBamSummary returned {n_data} count column(s) for {len(samples)} sample(s)."
+        )
+
+    names = [n for n, _g in samples]
+    with counts_path.open("w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["peak"] + names)
+        for line in lines[1:]:
+            p = line.split("\t")
+            if len(p) < 3 + len(samples):
+                continue
+            peak_id = f"{p[0]}:{p[1]}-{p[2]}"
+            writer.writerow([peak_id] + [int(round(float(p[3 + i]))) for i in range(len(samples))])
+
+    _write_coldata(coldata_path, list(samples))
+
+
 def _write(
     out_path: Path,
     samples: list[tuple[str, str, Path]],
