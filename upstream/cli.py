@@ -239,6 +239,20 @@ def _write_run_summary(
     console.print(f"[dim]Run summary → {Path(outdir) / 'run_summary.txt'}[/dim]")
 
 
+def _auto_multiqc(outdir: Path):
+    """Best-effort: aggregate the run's logs (fastp/STAR/Salmon/Bismark/…) into one
+    MultiQC report. Skipped in dry-run or if multiqc isn't installed (it's a bonus,
+    not a hard requirement). Returns the report path, or None."""
+    import shutil as _sh
+    if runner.DRY_RUN or _sh.which("multiqc") is None:
+        return None
+    mqc_dir = Path(outdir) / "multiqc"
+    console.print("  Aggregating QC with MultiQC…")
+    rc = runner.run(["multiqc", str(outdir), "--outdir", str(mqc_dir), "--force", "--quiet"])
+    report = mqc_dir / "multiqc_report.html"
+    return report if (rc == 0 and report.exists()) else None
+
+
 def _explain(content_file: str) -> None:
     try:
         pkg = importlib.resources.files("upstream") / "content" / content_file
@@ -484,6 +498,9 @@ def rnaseq(
     if output_format in ("matrix", "both"):
         _check(*checkpoints.check_counts_matrix(outdir / "counts_matrix.csv", outdir / "coldata.csv"))
 
+    mqc = _auto_multiqc(outdir)
+    if mqc:
+        written = list(written) + [mqc]
     _write_run_summary(outdir, "rnaseq", written, output_format,
                        {"samples": str(samples), "aligner": aligner})
     if dry_run:
@@ -627,6 +644,9 @@ def atacseq(
     runner.step_header("Build matrix output", 5, TOTAL)
     written = _build_peak_outputs(atac_results, outdir, output_format, threads,
                                   explain, "atacseq_export_formats.md")
+    mqc = _auto_multiqc(outdir)
+    if mqc:
+        written = list(written) + [mqc]
     _write_run_summary(outdir, "atacseq", written, output_format, {"samples": str(samples)})
     if dry_run:
         console.print("\n[bold green]Dry run complete.[/bold green] No tools were executed.")
@@ -791,6 +811,9 @@ def chipseq(
     runner.step_header("Build matrix output", 5, TOTAL)
     written = _build_peak_outputs(chip_results, outdir, output_format, threads,
                                   explain, "chipseq_export_formats.md")
+    mqc = _auto_multiqc(outdir)
+    if mqc:
+        written = list(written) + [mqc]
     _write_run_summary(outdir, "chipseq", written, output_format,
                        {"samples": str(samples), "peak_type": peak_type})
     if dry_run:
@@ -995,6 +1018,9 @@ def methylation(
     if output_format in ("matrix", "both"):
         _check(*checkpoints.check_counts_matrix(outdir / "mvalues_matrix.csv", outdir / "coldata.csv"))
 
+    mqc = _auto_multiqc(outdir)
+    if mqc:
+        written = list(written) + [mqc]
     _write_run_summary(outdir, "methylation", written, output_format,
                        {"method": "wgbs", "samples": str(samples)})
     console.print(f"\n[bold green]Done.[/bold green] Wrote: "
