@@ -2,13 +2,16 @@
 Data-location and download helpers for the upstream teaching tool.
 
 GEO raw sequencing data is accessed via SRA: each GEO sample (GSM) maps to one
-or more SRA run accessions (SRR).  Download uses the SRA Toolkit (fasterq-dump),
-then optionally subsamples with seqtk to keep runtimes manageable in a lab session.
+or more SRA run accessions (SRR).  Download uses prefetch (cloud mirror) then
+fasterq-dump on the local .sra — faster and more throttling-resistant than bare
+fasterq-dump streaming — then optionally subsamples with seqtk to keep runtimes
+manageable in a lab session.  Library layout (paired vs single-end) is detected
+from the extracted FASTQ.
 
 Search order when a student runs `upstream download --track <track>`:
   1. Shared server path (admin pre-staged via scripts/prepare_sample_data.sh)
   2. Local --outdir (student downloaded files themselves)
-  3. Automatic download via fasterq-dump (if SRR accessions are configured)
+  3. Automatic download via prefetch + fasterq-dump (if SRR accessions configured)
   4. Manual instructions panel
 
 Admin setup: fill in the 'srr' and 'geo' fields in CATALOG below, then run
@@ -16,6 +19,7 @@ scripts/prepare_sample_data.sh to stage the data for all students at once.
 """
 from __future__ import annotations
 
+import concurrent.futures as _futures
 import csv
 import shutil
 import subprocess
@@ -173,8 +177,17 @@ def locate_or_download(
             + (f"  (GEO: {info['geo']})" if info["geo"] else "")
             + "\n"
         )
-        _download_all(info["samples"], outdir, nreads, subsample)
-        _write_csv(info["samples"], expected, outdir, csv_path, track)
+        results = _download_all(info["samples"], outdir, nreads, subsample)
+        rows = [
+            {
+                "name": r["name"],
+                "group": r["group"],
+                "r1": str(Path(r["r1"]).resolve()),
+                "r2": str(Path(r["r2"]).resolve()) if r.get("r2") else "",
+            }
+            for r in results
+        ]
+        _emit_samplesheet(rows, outdir, csv_path, track)
         return
 
     # 4. No data found, SRR not configured
@@ -202,67 +215,101 @@ def _require_tool(name: str) -> str:
     return path
 
 
+def _find_sra(base: Path, srr: str) -> Optional[Path]:
+    """Locate the .sra file prefetch wrote under *base* for *srr*."""
+    for cand in (base / srr / f"{srr}.sra", base / f"{srr}.sra", base / srr / srr):
+        if cand.exists():
+            return cand
+    hits = list(base.glob(f"{srr}*/*.sra")) + list(base.glob(f"{srr}*.sra"))
+    return hits[0] if hits else None
+
+
 def _download_all(
     samples: list[dict],
     outdir: Path,
     nreads: int,
     subsample: bool,
-) -> None:
+) -> list[dict]:
+    """Download every sample (prefetch → fasterq-dump → subsample), concurrently.
+
+    Returns a result dict per sample: {name, group, r1, r2 (None if single-end), ok}.
+    Exits with an error if any sample fails.
+    """
+    _require_tool("prefetch")
     _require_tool("fasterq-dump")
     if subsample:
         _require_tool("seqtk")
 
-    for s in samples:
-        srr = s["srr"]
-        name = s["name"]
-        r1_final = outdir / f"{name}_R1.fastq.gz"
-        r2_final = outdir / f"{name}_R2.fastq.gz"
+    workers = min(4, len(samples)) or 1
+    with _futures.ThreadPoolExecutor(max_workers=workers) as ex:
+        results = list(
+            ex.map(lambda s: _download_one(s, outdir, nreads, subsample), samples)
+        )
 
-        if r1_final.exists() and r2_final.exists():
-            console.print(f"[dim]  {name}: FASTQ already present, skipping download.[/dim]")
-            continue
-
-        console.print(f"\n[bold cyan]{name}[/bold cyan] ({s['group']})  SRR: {srr}")
-        _fasterq_dump(srr, name, outdir, r1_final, r2_final, nreads, subsample)
-        console.print(f"  [green]✓[/green] {name} ready")
+    failed = [r["name"] for r in results if not r.get("ok")]
+    if failed:
+        console.print(f"[bold red]Error:[/bold red] download failed for: {', '.join(failed)}")
+        raise SystemExit(1)
+    return results
 
 
-def _fasterq_dump(
-    srr: str,
-    name: str,
-    outdir: Path,
-    r1_final: Path,
-    r2_final: Path,
-    nreads: int,
-    subsample: bool,
-) -> None:
-    """Run fasterq-dump for *srr*, producing gzipped paired FASTQ in *outdir*."""
-    tmp_r1 = outdir / f"{srr}_1.fastq"
-    tmp_r2 = outdir / f"{srr}_2.fastq"
+def _download_one(s: dict, outdir: Path, nreads: int, subsample: bool) -> dict:
+    srr, name, group = s["srr"], s["name"], s["group"]
+    r1_final = outdir / f"{name}_R1.fastq.gz"
+    r2_final = outdir / f"{name}_R2.fastq.gz"
+    base = {"name": name, "group": group}
 
-    if not (tmp_r1.exists() and tmp_r2.exists()):
-        console.print(f"  Fetching {srr} via fasterq-dump…")
-        rc = subprocess.run([
-            "fasterq-dump",
-            "--split-files",
-            "--outdir", str(outdir),
-            "--progress",
-            srr,
-        ]).returncode
-        if rc != 0:
-            console.print(f"[bold red]Error:[/bold red] fasterq-dump failed for {srr}.")
-            raise SystemExit(1)
+    if r1_final.exists():
+        layout = "paired" if r2_final.exists() else "single"
+        console.print(f"[dim]  {name}: FASTQ already present, skipping ({layout}).[/dim]")
+        return {**base, "r1": r1_final, "r2": (r2_final if r2_final.exists() else None), "ok": True}
 
-    if subsample:
-        console.print(f"  Subsampling to {nreads:,} reads…")
-        _seqtk_sample(tmp_r1, r1_final, nreads)
-        _seqtk_sample(tmp_r2, r2_final, nreads)
-        tmp_r1.unlink(missing_ok=True)
-        tmp_r2.unlink(missing_ok=True)
-    else:
-        console.print(f"  Compressing…")
-        _gzip_file(tmp_r1, r1_final)
-        _gzip_file(tmp_r2, r2_final)
+    sra_dir = outdir / f".sra_{srr}"
+    try:
+        # 1 — prefetch the run from the cloud mirror
+        console.print(f"[bold cyan]  {name}[/bold cyan] ({group})  prefetch {srr}…")
+        if subprocess.run(
+            ["prefetch", srr, "-O", str(sra_dir), "--max-size", "100g"]
+        ).returncode != 0:
+            console.print(f"[red]  ✗ {name}: prefetch failed.[/red]")
+            return {**base, "ok": False}
+        sra = _find_sra(sra_dir, srr)
+        if sra is None:
+            console.print(f"[red]  ✗ {name}: prefetch produced no .sra file.[/red]")
+            return {**base, "ok": False}
+
+        # 2 — extract locally (no network); layout detected from output files
+        console.print(f"  {name}: extracting reads…")
+        if subprocess.run(
+            ["fasterq-dump", str(sra), "--split-files", "--outdir", str(sra_dir)]
+        ).returncode != 0:
+            console.print(f"[red]  ✗ {name}: fasterq-dump failed.[/red]")
+            return {**base, "ok": False}
+
+        f1, f2 = sra_dir / f"{srr}_1.fastq", sra_dir / f"{srr}_2.fastq"
+        f0 = sra_dir / f"{srr}.fastq"
+        if f1.exists() and f2.exists():
+            layout, jobs = "paired", [(f1, r1_final), (f2, r2_final)]
+        elif f0.exists():
+            layout, jobs = "single", [(f0, r1_final)]
+        else:
+            console.print(f"[red]  ✗ {name}: no FASTQ produced by fasterq-dump.[/red]")
+            return {**base, "ok": False}
+
+        # 3 — subsample (or just compress)
+        for src, dest in jobs:
+            if subsample:
+                _seqtk_sample(src, dest, nreads)
+            else:
+                _gzip_file(src, dest)
+
+        console.print(f"  [green]✓[/green] {name} ready ({layout})")
+        return {**base, "r1": r1_final, "r2": (r2_final if layout == "paired" else None), "ok": True}
+    except SystemExit:
+        # _seqtk_sample/_gzip_file raise SystemExit on failure; turn into a failed result
+        return {**base, "ok": False}
+    finally:
+        shutil.rmtree(sra_dir, ignore_errors=True)
 
 
 def _seqtk_sample(src: Path, dest: Path, nreads: int) -> None:
@@ -306,6 +353,7 @@ def _write_csv(
     csv_path: Path,
     track: str,
 ) -> None:
+    """Write a samplesheet for pre-staged (shared/local) paired-end data."""
     rows = [
         {
             "name": s["name"],
@@ -315,6 +363,14 @@ def _write_csv(
         }
         for s, (r1, r2) in zip(samples, expected)
     ]
+    _emit_samplesheet(rows, base, csv_path, track)
+
+
+def _emit_samplesheet(rows: list[dict], base: Path, csv_path: Path, track: str) -> None:
+    """Write the rows to *csv_path* and print run instructions.
+
+    Single-end rows carry an empty r2; the pipeline tracks handle that automatically.
+    """
     csv_path.parent.mkdir(parents=True, exist_ok=True)
     with csv_path.open("w", newline="") as fh:
         writer = csv.DictWriter(fh, fieldnames=["name", "group", "r1", "r2"])
@@ -322,9 +378,13 @@ def _write_csv(
         writer.writerows(rows)
 
     console.print(f"\n[bold green]✓ Samplesheet written:[/bold green] {csv_path}")
-    console.print(f"  {len(rows)} sample(s) — data in [dim]{base}[/dim]\n")
+    console.print(f"  {len(rows)} sample(s) — data in [dim]{base}[/dim]")
+    if any(not r["r2"] for r in rows):
+        console.print(
+            "  [yellow]Note:[/yellow] single-end sample(s) written with an empty r2 column."
+        )
     console.print(
-        f"Run the pipeline with:\n"
+        f"\nRun the pipeline with:\n"
         f"  [bold]upstream {track} --samples {csv_path} --outdir results/[/bold]\n"
     )
 

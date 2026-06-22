@@ -65,10 +65,42 @@ def _read_samplesheet(path: Path) -> list[dict[str, str]]:
                 f"Invalid group '{row['group']}' for sample '{row['name']}'. "
                 "Must be 'disease' or 'control' (OBAMA requires these exact strings)."
             )
-        for key in ("r1", "r2"):
-            if not Path(row[key]).exists():
-                _die(f"File not found for sample '{row['name']}': {row[key]}")
+        # r1 is always required; r2 is optional (empty = single-end).
+        if not Path(row["r1"]).exists():
+            _die(f"File not found for sample '{row['name']}': {row['r1']}")
+        r2 = (row.get("r2") or "").strip()
+        if r2 and not Path(r2).exists():
+            _die(f"File not found for sample '{row['name']}': {r2}")
     return rows
+
+
+def _is_paired(s: dict) -> bool:
+    """A sample is paired-end when it has a non-empty r2 column."""
+    return bool((s.get("r2") or "").strip())
+
+
+def _fastp_cmd(
+    s: dict, name: str, trim_dir: Path, threads: int, extra: list[str],
+) -> tuple[list[str], Path, Optional[Path]]:
+    """Build the fastp command for a sample, handling paired vs single-end.
+
+    Returns (cmd, trimmed_r1, trimmed_r2_or_None).  `--detect_adapter_for_pe`
+    in *extra* is dropped for single-end input (fastp auto-detects SE adapters).
+    """
+    paired = _is_paired(s)
+    out1 = trim_dir / f"{name}_R1.fastq.gz"
+    out2 = trim_dir / f"{name}_R2.fastq.gz" if paired else None
+
+    cmd = ["fastp", "--in1", str(Path(s["r1"])), "--out1", str(out1)]
+    if paired:
+        cmd += ["--in2", str(Path(s["r2"])), "--out2", str(out2)]
+    cmd += [
+        "--json", str(trim_dir / f"{name}_fastp.json"),
+        "--html", str(trim_dir / f"{name}_fastp.html"),
+        "--thread", str(threads),
+    ]
+    cmd += [f for f in extra if not (f == "--detect_adapter_for_pe" and not paired)]
+    return cmd, out1, out2
 
 
 def _die(msg: str) -> None:
@@ -121,7 +153,11 @@ def qc(
     runner.step_header("FastQC", 1, 2)
     if explain:
         _explain("qc_fastqc.md")
-    all_fastq = [f for s in sample_list for f in (s["r1"], s["r2"])]
+    all_fastq = []
+    for s in sample_list:
+        all_fastq.append(s["r1"])
+        if _is_paired(s):
+            all_fastq.append(s["r2"])
     rc = runner.run(["fastqc", "--outdir", str(fastqc_out), "--threads", str(threads)] + all_fastq)
     if rc != 0:
         _die("FastQC failed.")
@@ -188,11 +224,12 @@ def rnaseq(
 
     for s in sample_list:
         name, group = s["name"], s["group"]
-        r1, r2 = Path(s["r1"]), Path(s["r2"])
+        paired = _is_paired(s)
         sdir = outdir / name
         sdir.mkdir(exist_ok=True)
 
-        console.rule(f"[bold white]Sample: {name}  ({group})[/bold white]", style="white")
+        layout = "paired-end" if paired else "single-end"
+        console.rule(f"[bold white]Sample: {name}  ({group})  [{layout}][/bold white]", style="white")
 
         # 1 — Trim
         runner.step_header("Trim — fastp", 1, TOTAL)
@@ -200,17 +237,8 @@ def rnaseq(
             _explain("rnaseq_trim.md")
         trim_dir = sdir / "trimmed"
         trim_dir.mkdir(exist_ok=True)
-        rc = runner.run([
-            "fastp",
-            "--in1",  str(r1),
-            "--in2",  str(r2),
-            "--out1", str(trim_dir / f"{name}_R1.fastq.gz"),
-            "--out2", str(trim_dir / f"{name}_R2.fastq.gz"),
-            "--json", str(trim_dir / f"{name}_fastp.json"),
-            "--html", str(trim_dir / f"{name}_fastp.html"),
-            "--thread", str(threads),
-            "--detect_adapter_for_pe",
-        ])
+        cmd, t_r1, t_r2 = _fastp_cmd(s, name, trim_dir, threads, ["--detect_adapter_for_pe"])
+        rc = runner.run(cmd)
         if rc != 0:
             _die(f"fastp failed for sample '{name}'.")
         _check(*checkpoints.check_fastp_trim(trim_dir / f"{name}_fastp.json"))
@@ -221,12 +249,13 @@ def rnaseq(
             if explain:
                 _explain("rnaseq_quantify.md")
             quant_dir = sdir / "salmon"
+            reads = (["--mates1", str(t_r1), "--mates2", str(t_r2)] if paired
+                     else ["--unmatedReads", str(t_r1)])
             rc = runner.run([
                 "salmon", "quant",
                 "--index",    str(salmon_index),
                 "--libType",  "A",
-                "--mates1",   str(trim_dir / f"{name}_R1.fastq.gz"),
-                "--mates2",   str(trim_dir / f"{name}_R2.fastq.gz"),
+                *reads,
                 "--threads",  str(threads),
                 "--output",   str(quant_dir),
                 "--validateMappings",
@@ -243,12 +272,12 @@ def rnaseq(
                 _explain("rnaseq_align.md")
             aln_dir = sdir / "aligned"
             aln_dir.mkdir(exist_ok=True)
+            read_files = [str(t_r1)] + ([str(t_r2)] if paired else [])
             rc = runner.run([
                 "STAR",
                 "--runThreadN",       str(threads),
                 "--genomeDir",        str(star_index),
-                "--readFilesIn",      str(trim_dir / f"{name}_R1.fastq.gz"),
-                                      str(trim_dir / f"{name}_R2.fastq.gz"),
+                "--readFilesIn",      *read_files,
                 "--readFilesCommand", "zcat",
                 "--outSAMtype",       "BAM", "SortedByCoordinate",
                 "--outSAMattributes", "NH", "HI", "AS", "NM",
@@ -299,11 +328,12 @@ def atacseq(
 
     for s in sample_list:
         name, group = s["name"], s["group"]
-        r1, r2 = Path(s["r1"]), Path(s["r2"])
+        paired = _is_paired(s)
         sdir = outdir / name
         sdir.mkdir(exist_ok=True)
 
-        console.rule(f"[bold white]Sample: {name}  ({group})[/bold white]", style="white")
+        layout = "paired-end" if paired else "single-end"
+        console.rule(f"[bold white]Sample: {name}  ({group})  [{layout}][/bold white]", style="white")
 
         # 1 — Trim
         runner.step_header("Trim — fastp", 1, TOTAL)
@@ -311,16 +341,8 @@ def atacseq(
             _explain("atacseq_trim.md")
         trim_dir = sdir / "trimmed"
         trim_dir.mkdir(exist_ok=True)
-        rc = runner.run([
-            "fastp",
-            "--in1",  str(r1), "--in2", str(r2),
-            "--out1", str(trim_dir / f"{name}_R1.fastq.gz"),
-            "--out2", str(trim_dir / f"{name}_R2.fastq.gz"),
-            "--json", str(trim_dir / f"{name}_fastp.json"),
-            "--html", str(trim_dir / f"{name}_fastp.html"),
-            "--thread", str(threads),
-            "--detect_adapter_for_pe",
-        ])
+        cmd, t_r1, t_r2 = _fastp_cmd(s, name, trim_dir, threads, ["--detect_adapter_for_pe"])
+        rc = runner.run(cmd)
         if rc != 0:
             _die(f"fastp failed for sample '{name}'.")
         _check(*checkpoints.check_fastp_trim(trim_dir / f"{name}_fastp.json"))
@@ -333,13 +355,17 @@ def atacseq(
         aln_dir.mkdir(exist_ok=True)
         bam_raw = aln_dir / f"{name}.bam"
 
+        # Paired-end uses concordant-pair flags (-X/--no-mixed/--no-discordant);
+        # single-end aligns unpaired reads with -U.
+        reads = (["-1", str(t_r1), "-2", str(t_r2),
+                  "--no-mixed", "--no-discordant", "-X", "2000"] if paired
+                 else ["-U", str(t_r1)])
         rc = runner.pipe(
             ["bowtie2",
              "--threads", str(threads),
              "-x", str(bt2_prefix),
-             "-1", str(trim_dir / f"{name}_R1.fastq.gz"),
-             "-2", str(trim_dir / f"{name}_R2.fastq.gz"),
-             "--very-sensitive", "--no-mixed", "--no-discordant", "-X", "2000"],
+             *reads,
+             "--very-sensitive"],
             ["samtools", "sort", "-o", str(bam_raw), "-"],
         )
         if rc != 0:
@@ -467,11 +493,12 @@ def methylation(
 
     for s in sample_list:
         name, group = s["name"], s["group"]
-        r1, r2 = Path(s["r1"]), Path(s["r2"])
+        paired = _is_paired(s)
         sdir = outdir / name
         sdir.mkdir(exist_ok=True)
 
-        console.rule(f"[bold white]Sample: {name}  ({group})[/bold white]", style="white")
+        layout = "paired-end" if paired else "single-end"
+        console.rule(f"[bold white]Sample: {name}  ({group})  [{layout}][/bold white]", style="white")
 
         # 1 — Trim
         runner.step_header("Trim — fastp", 1, TOTAL)
@@ -479,18 +506,11 @@ def methylation(
             _explain("methylation_trim.md")
         trim_dir = sdir / "trimmed"
         trim_dir.mkdir(exist_ok=True)
-        rc = runner.run([
-            "fastp",
-            "--in1",  str(r1), "--in2", str(r2),
-            "--out1", str(trim_dir / f"{name}_R1.fastq.gz"),
-            "--out2", str(trim_dir / f"{name}_R2.fastq.gz"),
-            "--json", str(trim_dir / f"{name}_fastp.json"),
-            "--html", str(trim_dir / f"{name}_fastp.html"),
-            "--thread", str(threads),
-            "--detect_adapter_for_pe",
-            "--trim_poly_g",
-            "--length_required", "36",
-        ])
+        cmd, t_r1, t_r2 = _fastp_cmd(
+            s, name, trim_dir, threads,
+            ["--detect_adapter_for_pe", "--trim_poly_g", "--length_required", "36"],
+        )
+        rc = runner.run(cmd)
         if rc != 0:
             _die(f"fastp failed for sample '{name}'.")
         _check(*checkpoints.check_fastp_trim(trim_dir / f"{name}_fastp.json"))
@@ -501,19 +521,25 @@ def methylation(
             _explain("methylation_align.md")
         bismark_dir = sdir / "bismark"
         bismark_dir.mkdir(exist_ok=True)
+        # Bismark: paired-end uses -1/-2 and emits *_pe.bam / *_PE_report.txt;
+        # single-end takes the read file directly and emits *.bam / *_SE_report.txt.
+        reads = (["-1", str(t_r1), "-2", str(t_r2)] if paired else [str(t_r1)])
         rc = runner.run([
             "bismark",
             "--genome",     str(bismark_genome),
-            "-1",           str(trim_dir / f"{name}_R1.fastq.gz"),
-            "-2",           str(trim_dir / f"{name}_R2.fastq.gz"),
+            *reads,
             "--output_dir", str(bismark_dir),
             "-p",           "2",
             "--basename",   name,
         ])
         if rc != 0:
             _die(f"Bismark alignment failed for sample '{name}'.")
-        bam = bismark_dir / f"{name}_bismark_bt2_pe.bam"
-        report = bismark_dir / f"{name}_bismark_bt2_PE_report.txt"
+        if paired:
+            bam = bismark_dir / f"{name}_bismark_bt2_pe.bam"
+            report = bismark_dir / f"{name}_bismark_bt2_PE_report.txt"
+        else:
+            bam = bismark_dir / f"{name}_bismark_bt2.bam"
+            report = bismark_dir / f"{name}_bismark_bt2_SE_report.txt"
         _check(*checkpoints.check_bismark_bam(bam, report))
 
         # 3 — Methylation extraction
@@ -524,7 +550,7 @@ def methylation(
         methyl_dir.mkdir(exist_ok=True)
         rc = runner.run([
             "bismark_methylation_extractor",
-            "--paired-end",
+            "--paired-end" if paired else "--single-end",
             "--comprehensive",
             "--CX_context",
             "--cytosine_report",
