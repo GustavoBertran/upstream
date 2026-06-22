@@ -27,7 +27,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse, StreamingResponse
 from pydantic import BaseModel
 
-from . import __version__, preflight
+from . import __version__, diagnostics, preflight
 from .samplesheet import scan_fastq_dir
 
 _ANSI_RE = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]")
@@ -118,6 +118,12 @@ def _preflight_issues(req: "RunRequest") -> list[str]:
 def api_check(req: RunRequest) -> dict:
     """Pre-run validation for the web UI's Run gate. Returns {issues: [...]}."""
     return {"issues": _preflight_issues(req)}
+
+
+@app.get("/api/diagnostics")
+def api_diagnostics() -> dict:
+    """Environment diagnostics for the 'Report a bug' link."""
+    return {"text": diagnostics.as_text(), "issues_url": diagnostics.ISSUES_NEW_URL}
 
 
 @app.get("/api/samplesheet")
@@ -732,7 +738,9 @@ input:checked+.slider::before{transform:translateX(14px)}
   <div class="sidebar-footer">
     Pipeline runs on the server.<br>
     Output streams here live.<br>
-    <span style="opacity:.65">upstream v{{VERSION}}</span>
+    <span style="opacity:.65">upstream v{{VERSION}}</span><br>
+    <a href="#" onclick="reportBug();return false;"
+       style="color:var(--accent);text-decoration:none">&#9873; Report a bug</a>
   </div>
 </div>
 
@@ -1706,7 +1714,9 @@ async function _kickoffRun(body, label, nsteps) {
         ? '<span style="color:var(--green)">✓ Complete</span>'
         : d.status==="cancelled"
           ? '<span style="color:var(--yellow)">Cancelled</span>'
-          : '<span style="color:var(--red)">✗ Failed (exit '+d.exit_code+')</span>';
+          : '<span style="color:var(--red)">✗ Failed (exit '+d.exit_code+')</span> '
+            + '<a href="#" onclick="reportRunError();return false;" '
+            + 'style="color:var(--accent);text-decoration:none">&#9873; Report this error</a>';
       document.getElementById("btn-stop").style.display  = "none";
       document.getElementById("btn-newrun").style.display = "";
       if (ok) {
@@ -1955,6 +1965,25 @@ document.addEventListener("change", function(e){
     try { localStorage.setItem("us:" + t.id, t.value); } catch (e2) {}
   }
 });
+
+// Open a prefilled GitHub issue with environment diagnostics (and error output,
+// when reporting a failed run).
+async function reportBug(errorContext) {
+  var diag = "";
+  try { diag = (await (await fetch("/api/diagnostics")).json()).text; } catch (e) {}
+  var body = "## What happened\\n\\n_Describe what you did and what went wrong._\\n\\n"
+           + "## Environment\\n```\\n" + diag + "\\n```\\n";
+  if (errorContext) body += "\\n## Error output\\n```\\n" + errorContext + "\\n```\\n";
+  var url = "https://github.com/GustavoBertran/upstream/issues/new"
+          + "?title=" + encodeURIComponent("[bug] ")
+          + "&body=" + encodeURIComponent(body);
+  window.open(url, "_blank");
+}
+
+function reportRunError() {
+  var log = document.getElementById("log");
+  reportBug(log ? log.textContent.slice(-2000) : "");
+}
 
 selectTrack("rnaseq");
 _restoreInputs();

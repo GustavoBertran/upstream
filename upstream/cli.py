@@ -28,7 +28,7 @@ from rich.console import Console
 from rich.markdown import Markdown
 from rich.panel import Panel
 
-from . import __version__, checkpoints, downloader, obama, preflight, runner
+from . import __version__, checkpoints, diagnostics, downloader, obama, preflight, runner
 from .samplesheet import scan_fastq_dir
 
 app = typer.Typer(
@@ -1078,6 +1078,29 @@ def samplesheet(
     )
     console.print("[dim]Next: fill in the 'group' column (disease/control), then run a track "
                   "(or 'upstream check').[/dim]")
+
+
+# ── Bug report ───────────────────────────────────────────────────────────────
+
+
+@app.command()
+def bug(
+    out: Annotated[Optional[Path], typer.Option(
+        "--out", help="Also save the diagnostics to this file.")] = None,
+) -> None:
+    """Print environment diagnostics and where to report a bug.
+
+    Paste the diagnostics into a new issue along with the command you ran and the
+    error message you saw.
+    """
+    text = diagnostics.as_text()
+    console.print(Panel(text, title="[bold]Environment diagnostics[/bold]", border_style="yellow"))
+    console.print(f"\nReport issues at: [bold cyan]{diagnostics.ISSUES_NEW_URL}[/bold cyan]")
+    console.print("Include: (1) the diagnostics above, (2) the command you ran, "
+                  "(3) the full error message.")
+    if out:
+        out.write_text(text + "\n")
+        console.print(f"[dim]Saved diagnostics → {out}[/dim]")
 
 
 # ── Check (preflight) ────────────────────────────────────────────────────────
