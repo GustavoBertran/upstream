@@ -278,6 +278,13 @@ def geo_srr(gsm: str) -> dict:
     return {"gsm": gsm, "srrs": geo.fetch_srr(gsm)}
 
 
+@app.get("/api/geo/char/{gse}")
+def geo_char(gse: str) -> dict:
+    """Return sample characteristics from the GEO series matrix file."""
+    from . import geo
+    return geo.fetch_characteristics(gse)
+
+
 @app.get("/api/browse")
 def browse(path: str = "~") -> dict:
     """List directory contents for the in-browser file picker."""
@@ -459,6 +466,29 @@ input:checked+.slider::before{transform:translateX(14px)}
              cursor:pointer;font-size:.78rem;color:var(--text)}
 .browser-row:hover{background:var(--bg3);color:var(--bright)}
 .browser-icon{flex-shrink:0;opacity:.7}
+/* GEO table: sort + facet filters */
+.geo-sort{cursor:pointer;user-select:none}
+.geo-sort:hover{color:var(--bright)}
+.sort-ind{font-size:.6rem;margin-left:.2rem;color:var(--accent);vertical-align:middle}
+#geo-facets{display:none;flex-wrap:wrap;gap:.35rem;margin-bottom:.6rem}
+.facet-group{position:relative;display:inline-block}
+.facet-btn{background:var(--bg2);border:1px solid var(--border);border-radius:4px;
+           color:var(--dim);cursor:pointer;font-size:.7rem;padding:.22rem .6rem;
+           white-space:nowrap;transition:border-color .15s,color .15s}
+.facet-btn:hover,.facet-btn.active{border-color:var(--accent);color:var(--bright)}
+.facet-popup{display:none;position:absolute;top:calc(100% + 3px);left:0;z-index:60;
+             min-width:155px;max-height:215px;overflow-y:auto;background:var(--bg2);
+             border:1px solid var(--border);border-radius:5px;padding:.2rem 0;
+             box-shadow:0 4px 14px rgba(0,0,0,.45)}
+.facet-popup.open{display:block}
+.facet-ctrl{display:flex;gap:.35rem;padding:.25rem .65rem .3rem;
+            border-bottom:1px solid var(--border);margin-bottom:.1rem}
+.facet-ctrl-btn{background:none;border:none;color:var(--accent);cursor:pointer;
+                font-size:.68rem;padding:0}
+.facet-ctrl-btn:hover{text-decoration:underline}
+.facet-item{display:flex;align-items:center;gap:.4rem;padding:.2rem .65rem;font-size:.74rem}
+.facet-item:hover{background:var(--bg3)}
+.facet-count{margin-left:auto;font-size:.64rem;color:var(--dim)}
 </style>
 </head>
 <body>
@@ -543,13 +573,10 @@ input:checked+.slider::before{transform:translateX(14px)}
 
       <div id="geo-results" style="display:none">
         <div id="geo-series-info"></div>
+        <div id="geo-facets"></div>
         <div class="geo-table-wrap">
-          <table class="geo-table">
-            <thead>
-              <tr>
-                <th>Sample (GSM)</th><th>Title</th><th>Group</th><th>SRR</th>
-              </tr>
-            </thead>
+          <table class="geo-table" id="geo-table">
+            <thead id="geo-thead"></thead>
             <tbody id="geo-tbody"></tbody>
           </table>
         </div>
@@ -741,60 +768,287 @@ function updateMethylationMethod() {
 
 // ── GEO download ──────────────────────────────────────────────────────────
 
+var _geoRows = [];
+var _geoCharKeys = [];
+var _geoFilters = {};
+var _geoSortCol = null;
+var _geoSortAsc = true;
+
 function geoMsg(msg, color) {
-  const el = document.getElementById("geo-msg");
+  var el = document.getElementById("geo-msg");
   el.textContent = msg; el.style.color = color || "var(--red)";
 }
 
+function _geoSortedFiltered() {
+  var rows = _geoRows.filter(function(row) {
+    for (var col in _geoFilters) {
+      var allowed = _geoFilters[col];
+      if (allowed.size > 0 && !allowed.has(String(row[col] || ""))) return false;
+    }
+    return true;
+  });
+  if (_geoSortCol) {
+    var sc = _geoSortCol, asc = _geoSortAsc;
+    rows = rows.slice().sort(function(a, b) {
+      var va = String(a[sc] || ""), vb = String(b[sc] || "");
+      var na = parseFloat(va), nb = parseFloat(vb);
+      if (!isNaN(na) && !isNaN(nb)) return asc ? na - nb : nb - na;
+      return asc ? va.localeCompare(vb) : vb.localeCompare(va);
+    });
+  }
+  return rows;
+}
+
+function geoSortBy(col) {
+  if (_geoSortCol === col) { _geoSortAsc = !_geoSortAsc; }
+  else { _geoSortCol = col; _geoSortAsc = true; }
+  _buildGeoHeader();
+  renderGeoTable();
+}
+
+function _buildGeoHeader() {
+  var thead = document.getElementById("geo-thead");
+  if (!thead) return;
+  thead.innerHTML = "";
+  var tr = document.createElement("tr");
+  var cols = [{key:"gsm",label:"Sample (GSM)"},{key:"title",label:"Title"}];
+  for (var ki = 0; ki < _geoCharKeys.length; ki++) {
+    cols.push({key:_geoCharKeys[ki], label:_geoCharKeys[ki]});
+  }
+  cols.push({key:"_group",label:"Group"}, {key:"_srr",label:"SRR"});
+  for (var ci = 0; ci < cols.length; ci++) {
+    var col = cols[ci];
+    var th = document.createElement("th");
+    if (col.key !== "_group" && col.key !== "_srr") {
+      th.className = "geo-sort";
+      (function(k){ th.onclick = function(){ geoSortBy(k); }; })(col.key);
+      var ind = (_geoSortCol === col.key)
+        ? '<span class="sort-ind">'+(_geoSortAsc ? "&#9650;" : "&#9660;")+"</span>"
+        : '<span class="sort-ind" style="opacity:0">&#9650;</span>';
+      th.innerHTML = col.label + ind;
+    } else {
+      th.textContent = col.label;
+    }
+    tr.appendChild(th);
+  }
+  thead.appendChild(tr);
+}
+
+function _buildFacets() {
+  var panel = document.getElementById("geo-facets");
+  if (!panel) return;
+  panel.innerHTML = "";
+  var hasAny = false;
+  for (var ki = 0; ki < _geoCharKeys.length; ki++) {
+    var col = _geoCharKeys[ki];
+    var seen = {}, unique = [];
+    for (var ri = 0; ri < _geoRows.length; ri++) {
+      var v = String(_geoRows[ri][col] || "");
+      if (!seen[v]) { seen[v] = 0; }
+      seen[v]++;
+    }
+    unique = Object.keys(seen).sort(function(a,b){
+      var na=parseFloat(a),nb=parseFloat(b);
+      if(!isNaN(na)&&!isNaN(nb)) return na-nb;
+      return a.localeCompare(b);
+    });
+    if (unique.length < 2) continue;
+    hasAny = true;
+
+    var wrap = document.createElement("div");
+    wrap.className = "facet-group";
+    var btn = document.createElement("button");
+    btn.className = "facet-btn"; btn.id = "facet-btn-"+col;
+    btn.textContent = col;
+    var popup = document.createElement("div");
+    popup.className = "facet-popup"; popup.id = "facet-popup-"+col;
+    popup.addEventListener("click", function(e){ e.stopPropagation(); });
+
+    var ctrl = document.createElement("div");
+    ctrl.className = "facet-ctrl";
+    var selAllBtn = document.createElement("button");
+    selAllBtn.className = "facet-ctrl-btn"; selAllBtn.textContent = "All";
+    var desAllBtn = document.createElement("button");
+    desAllBtn.className = "facet-ctrl-btn"; desAllBtn.textContent = "None";
+    (function(c, p, u){
+      selAllBtn.onclick = function(){
+        p.querySelectorAll("input[type=checkbox]").forEach(function(cb){cb.checked=true;});
+        delete _geoFilters[c];
+        _updateFacetBtn(c, u.length, u.length);
+        renderGeoTable();
+      };
+      desAllBtn.onclick = function(){
+        p.querySelectorAll("input[type=checkbox]").forEach(function(cb){cb.checked=false;});
+        _geoFilters[c] = new Set();
+        _updateFacetBtn(c, 0, u.length);
+        renderGeoTable();
+      };
+    })(col, popup, unique);
+    ctrl.appendChild(selAllBtn); ctrl.appendChild(desAllBtn);
+    popup.appendChild(ctrl);
+
+    for (var ui = 0; ui < unique.length; ui++) {
+      var val = unique[ui];
+      var item = document.createElement("label");
+      item.className = "facet-item";
+      var cb = document.createElement("input");
+      cb.type = "checkbox";
+      cb.checked = !(_geoFilters[col] && !_geoFilters[col].has(val));
+      cb.dataset.v = val;
+      var span = document.createElement("span");
+      span.textContent = val || "(empty)";
+      var cnt = document.createElement("span");
+      cnt.className = "facet-count"; cnt.textContent = seen[val];
+      item.appendChild(cb); item.appendChild(span); item.appendChild(cnt);
+      popup.appendChild(item);
+    }
+
+    (function(c, p, u){
+      p.querySelectorAll("input[type=checkbox]").forEach(function(cb){
+        cb.onchange = function(){
+          var checked = Array.from(p.querySelectorAll("input[type=checkbox]:checked"))
+            .map(function(x){ return x.dataset.v; });
+          if (checked.length === u.length) { delete _geoFilters[c]; }
+          else { _geoFilters[c] = new Set(checked); }
+          _updateFacetBtn(c, checked.length, u.length);
+          renderGeoTable();
+        };
+      });
+    })(col, popup, unique);
+
+    (function(p, b){
+      b.onclick = function(e){ e.stopPropagation();
+        document.querySelectorAll(".facet-popup.open").forEach(function(x){ if(x!==p) x.classList.remove("open"); });
+        p.classList.toggle("open");
+      };
+    })(popup, btn);
+
+    wrap.appendChild(btn); wrap.appendChild(popup);
+    panel.appendChild(wrap);
+  }
+  panel.style.display = hasAny ? "flex" : "none";
+}
+
+function _updateFacetBtn(col, selected, total) {
+  var btn = document.getElementById("facet-btn-"+col);
+  if (!btn) return;
+  if (selected === total) { btn.textContent = col; btn.classList.remove("active"); }
+  else { btn.textContent = col+": "+selected+"/"+total+" selected"; btn.classList.add("active"); }
+}
+
+function renderGeoTable() {
+  var tbody = document.getElementById("geo-tbody");
+  if (!tbody) return;
+  var rows = _geoSortedFiltered();
+  tbody.innerHTML = "";
+  for (var i = 0; i < rows.length; i++) {
+    var row = rows[i];
+    var tr = document.createElement("tr");
+    var tdG = document.createElement("td");
+    tdG.style.cssText = "font-family:monospace;font-size:.72rem";
+    tdG.textContent = row.gsm; tr.appendChild(tdG);
+    var tdT = document.createElement("td");
+    tdT.textContent = row.title; tr.appendChild(tdT);
+    for (var ki = 0; ki < _geoCharKeys.length; ki++) {
+      var td = document.createElement("td");
+      td.textContent = row[_geoCharKeys[ki]] || ""; tr.appendChild(td);
+    }
+    var tdGrp = document.createElement("td");
+    var sel = document.createElement("select");
+    sel.className = "grp-sel"; sel.dataset.gsm = row.gsm;
+    ["disease","control","skip"].forEach(function(v){
+      var opt = document.createElement("option");
+      opt.value = v; opt.textContent = v;
+      if (v === row.group) opt.selected = true;
+      sel.appendChild(opt);
+    });
+    (function(r){ sel.onchange = function(){ r.group = sel.value; }; })(row);
+    tdGrp.appendChild(sel); tr.appendChild(tdGrp);
+    var tdS = document.createElement("td");
+    tdS.id = "srr-"+row.gsm;
+    if (row.srr === null) {
+      tdS.innerHTML = '<span class="spin" style="font-size:.8rem">&#8635;</span>';
+    } else if (!row.srr) {
+      tdS.textContent = "not found"; tdS.className = "srr-err";
+    } else {
+      tdS.textContent = row.srr; tdS.className = "srr-cell";
+    }
+    tr.appendChild(tdS);
+    tbody.appendChild(tr);
+  }
+}
+
 async function fetchGSE() {
-  const inp = document.getElementById("inp-gse");
-  const gse = inp.value.trim().toUpperCase();
+  var inp = document.getElementById("inp-gse");
+  var gse = inp.value.trim().toUpperCase();
   inp.value = gse;
   geoMsg(""); document.getElementById("geo-results").style.display = "none";
   if (!gse) { geoMsg("Enter a GSE accession."); return; }
-  const btn = document.getElementById("btn-fetch");
+  var btn = document.getElementById("btn-fetch");
   btn.disabled = true; btn.textContent = "Fetching…";
+  _geoRows = []; _geoCharKeys = []; _geoFilters = {};
+  _geoSortCol = null; _geoSortAsc = true;
+  var panel = document.getElementById("geo-facets");
+  if (panel) { panel.innerHTML = ""; panel.style.display = "none"; }
   try {
-    const res = await fetch("/api/geo/"+gse);
-    const data = await res.json();
+    var res = await fetch("/api/geo/"+gse);
+    var data = await res.json();
     if (!res.ok) { geoMsg(data.detail || "Series not found."); return; }
 
     document.getElementById("geo-series-info").textContent =
       data.gse+" — "+data.title+" — "+data.organism+" — "+data.n_samples+" samples";
 
-    const tbody = document.getElementById("geo-tbody");
-    tbody.innerHTML = "";
-    for (const s of data.samples) {
-      const tr = document.createElement("tr");
-      tr.innerHTML =
-        '<td style="font-family:monospace;font-size:.72rem">'+s.gsm+'</td>'+
-        '<td>'+s.title+'</td>'+
-        '<td><select class="grp-sel" data-gsm="'+s.gsm+'">'+
-          '<option value="disease">disease</option>'+
-          '<option value="control">control</option>'+
-          '<option value="skip">skip</option>'+
-        '</select></td>'+
-        '<td class="srr-cell" id="srr-'+s.gsm+'"><span class="spin" style="font-size:.8rem">&#8635;</span></td>';
-      tbody.appendChild(tr);
-    }
+    _geoRows = data.samples.map(function(s){
+      return {gsm:s.gsm, title:s.title, srr:null, group:"disease"};
+    });
+    _buildGeoHeader();
+    renderGeoTable();
     document.getElementById("geo-results").style.display = "";
-    geoMsg("Loading SRR accessions…", "var(--dim)");
+    geoMsg("Loading metadata…", "var(--dim)");
 
-    // fetch SRRs concurrently — server rate-limits NCBI calls internally
-    Promise.all(data.samples.map(function(s) {
+    // Fetch characteristics in background — augments table when ready
+    fetch("/api/geo/char/"+gse)
+      .then(function(r){ return r.json(); })
+      .then(function(chars){
+        var keySet = {};
+        for (var gsm in chars) {
+          var c = (chars[gsm] && chars[gsm].characteristics) || {};
+          for (var k in c) { keySet[k] = true; }
+        }
+        _geoCharKeys = Object.keys(keySet).sort();
+        for (var i = 0; i < _geoRows.length; i++) {
+          var row = _geoRows[i];
+          var charInfo = (chars[row.gsm] && chars[row.gsm].characteristics) || {};
+          for (var ki = 0; ki < _geoCharKeys.length; ki++) {
+            row[_geoCharKeys[ki]] = charInfo[_geoCharKeys[ki]] || "";
+          }
+        }
+        _buildGeoHeader();
+        _buildFacets();
+        renderGeoTable();
+      })
+      .catch(function(){});  // characteristics unavailable — proceed without them
+
+    // Fetch SRRs concurrently
+    Promise.all(data.samples.map(function(s){
       return fetch("/api/geo/srr/"+s.gsm)
-        .then(function(r) { return r.json(); })
-        .then(function(d) {
-          const td = document.getElementById("srr-"+s.gsm);
-          if (!td) return;
-          if (d.srrs && d.srrs.length) {
-            td.textContent = d.srrs[0];
-            td.dataset.srr = d.srrs[0];
-          } else {
-            td.textContent = "not found"; td.className = "srr-err";
+        .then(function(r){ return r.json(); })
+        .then(function(d){
+          var row = null;
+          for (var i = 0; i < _geoRows.length; i++) {
+            if (_geoRows[i].gsm === s.gsm) { row = _geoRows[i]; break; }
+          }
+          if (row) row.srr = (d.srrs && d.srrs.length) ? d.srrs[0] : "";
+          var td = document.getElementById("srr-"+s.gsm);
+          if (td) {
+            if (d.srrs && d.srrs.length) {
+              td.textContent = d.srrs[0]; td.className = "srr-cell";
+            } else {
+              td.textContent = "not found"; td.className = "srr-err";
+            }
           }
         });
-    })).then(function() { geoMsg(""); });
+    })).then(function(){ geoMsg(""); });
 
   } catch(e) {
     geoMsg("Network error: "+e.message);
@@ -805,30 +1059,31 @@ async function fetchGSE() {
 
 async function startGeoDownload() {
   document.getElementById("geo-dl-msg").textContent = "";
-  const outdir = document.getElementById("inp-geo-outdir").value.trim() || "data/";
-  const geoSamples = [];
-
-  for (const sel of document.querySelectorAll(".grp-sel")) {
-    if (sel.value === "skip") continue;
-    const gsm = sel.dataset.gsm;
-    const td  = document.getElementById("srr-"+gsm);
-    const srr = td && td.dataset && td.dataset.srr;
-    if (!srr) {
+  var outdir = document.getElementById("inp-geo-outdir").value.trim() || "data/";
+  var geoSamples = [];
+  var visible = _geoSortedFiltered();
+  for (var i = 0; i < visible.length; i++) {
+    var row = visible[i];
+    if (row.group === "skip") continue;
+    if (row.srr === null) {
       document.getElementById("geo-dl-msg").textContent =
-        "SRR not loaded for "+gsm+" yet — wait a moment and try again.";
+        "SRR not loaded for "+row.gsm+" yet — wait a moment and try again.";
       return;
     }
-    geoSamples.push({gsm:gsm, srr:srr, name:gsm, group:sel.value});
+    if (!row.srr) {
+      document.getElementById("geo-dl-msg").textContent =
+        "No SRR found for "+row.gsm+". Mark it as ‘skip’ or use a different dataset.";
+      return;
+    }
+    geoSamples.push({gsm:row.gsm, srr:row.srr, name:row.gsm, group:row.group});
   }
-
-  const disease = geoSamples.filter(function(s){return s.group==="disease";});
-  const control = geoSamples.filter(function(s){return s.group==="control";});
+  var disease = geoSamples.filter(function(s){return s.group==="disease";});
+  var control = geoSamples.filter(function(s){return s.group==="control";});
   if (!disease.length || !control.length) {
     document.getElementById("geo-dl-msg").textContent =
       "Assign at least one disease and one control sample.";
     return;
   }
-
   await _kickoffRun(
     {track:"download_geo", outdir:outdir, geo_samples:geoSamples},
     "Download Data",
@@ -1064,6 +1319,11 @@ function newRun() {
   document.getElementById("log-panel").style.display = "none";
   document.getElementById("setup-panel").style.display = "";
 }
+
+// Close any open facet popup when clicking elsewhere
+document.addEventListener("click", function(){
+  document.querySelectorAll(".facet-popup.open").forEach(function(p){ p.classList.remove("open"); });
+});
 
 selectTrack("rnaseq");
 </script>
