@@ -185,6 +185,60 @@ def _check(ok: bool, msg: str) -> None:
         raise typer.Exit(1)
 
 
+def _next_steps(track: str, output_format: Optional[str]) -> list[str]:
+    """Human-readable 'what to do next' lines for the run summary."""
+    if track == "qc":
+        return ["Open multiqc_report.html in a browser to review per-sample QC."]
+    steps: list[str] = []
+    fmt = output_format or "obama"
+    if fmt in ("obama", "both"):
+        steps.append("OBAMA: load obama_matrix.csv into the OBAMA Shiny app "
+                     "(geo_accession + disease.state columns).")
+    if fmt in ("matrix", "both"):
+        if track == "methylation":
+            steps.append("limma: load mvalues_matrix.csv + coldata.csv "
+                         "(see content/methylation_export_formats.md).")
+        elif track in ("atacseq", "chipseq"):
+            steps.append(f"DESeq2/edgeR: load counts_matrix.csv + coldata.csv "
+                         f"(see content/{track}_export_formats.md).")
+        else:
+            steps.append("DESeq2/edgeR/limma-voom: load counts_matrix.csv + coldata.csv "
+                         "(see content/rnaseq_export_formats.md).")
+    return steps
+
+
+def _write_run_summary(
+    outdir: Path,
+    track: str,
+    written: list,
+    output_format: Optional[str] = None,
+    inputs: Optional[dict] = None,
+) -> None:
+    """Write run_summary.txt (skipped in dry-run): inputs, outputs, and next steps."""
+    if runner.DRY_RUN:
+        return
+    from datetime import datetime as _dt
+    lines = [
+        f"upstream {track} — run summary",
+        f"generated:        {_dt.now().isoformat(timespec='seconds')}",
+        f"output directory: {Path(outdir).resolve()}",
+        "",
+    ]
+    if inputs:
+        lines.append("inputs:")
+        lines += [f"  {k}: {v}" for k, v in inputs.items() if v]
+        lines.append("")
+    lines.append("outputs:")
+    lines += [f"  - {Path(p).name}" for p in written] or ["  (none)"]
+    steps = _next_steps(track, output_format)
+    if steps:
+        lines.append("")
+        lines.append("next steps:")
+        lines += [f"  - {s}" for s in steps]
+    (Path(outdir) / "run_summary.txt").write_text("\n".join(lines) + "\n")
+    console.print(f"[dim]Run summary → {Path(outdir) / 'run_summary.txt'}[/dim]")
+
+
 def _explain(content_file: str) -> None:
     try:
         pkg = importlib.resources.files("upstream") / "content" / content_file
@@ -238,6 +292,9 @@ def qc(
         _die("MultiQC failed.")
     _check(*checkpoints.check_multiqc_output(multiqc_out))
 
+    _write_run_summary(outdir, "qc",
+                       [multiqc_out / "multiqc_report.html", fastqc_out], None,
+                       {"samples": str(samples)})
     console.print(f"\n[bold green]QC complete.[/bold green] Open {multiqc_out}/multiqc_report.html")
 
 
@@ -427,6 +484,8 @@ def rnaseq(
     if output_format in ("matrix", "both"):
         _check(*checkpoints.check_counts_matrix(outdir / "counts_matrix.csv", outdir / "coldata.csv"))
 
+    _write_run_summary(outdir, "rnaseq", written, output_format,
+                       {"samples": str(samples), "aligner": aligner})
     if dry_run:
         console.print("\n[bold green]Dry run complete.[/bold green] No tools were executed.")
     else:
@@ -568,6 +627,7 @@ def atacseq(
     runner.step_header("Build matrix output", 5, TOTAL)
     written = _build_peak_outputs(atac_results, outdir, output_format, threads,
                                   explain, "atacseq_export_formats.md")
+    _write_run_summary(outdir, "atacseq", written, output_format, {"samples": str(samples)})
     if dry_run:
         console.print("\n[bold green]Dry run complete.[/bold green] No tools were executed.")
     else:
@@ -731,6 +791,8 @@ def chipseq(
     runner.step_header("Build matrix output", 5, TOTAL)
     written = _build_peak_outputs(chip_results, outdir, output_format, threads,
                                   explain, "chipseq_export_formats.md")
+    _write_run_summary(outdir, "chipseq", written, output_format,
+                       {"samples": str(samples), "peak_type": peak_type})
     if dry_run:
         console.print("\n[bold green]Dry run complete.[/bold green] No tools were executed.")
     else:
@@ -807,6 +869,8 @@ def methylation(
             _check(*checkpoints.check_obama_format(outdir / "obama_matrix.csv"))
         if output_format in ("matrix", "both"):
             _check(*checkpoints.check_counts_matrix(outdir / "mvalues_matrix.csv", outdir / "coldata.csv"))
+        _write_run_summary(outdir, "methylation", written, output_format,
+                           {"method": "array", "betas": str(betas), "metadata": str(metadata)})
         console.print(f"\n[bold green]Done.[/bold green] Wrote: "
                       f"{', '.join(p.name for p in written)} → {outdir}")
         return
@@ -931,6 +995,8 @@ def methylation(
     if output_format in ("matrix", "both"):
         _check(*checkpoints.check_counts_matrix(outdir / "mvalues_matrix.csv", outdir / "coldata.csv"))
 
+    _write_run_summary(outdir, "methylation", written, output_format,
+                       {"method": "wgbs", "samples": str(samples)})
     console.print(f"\n[bold green]Done.[/bold green] Wrote: "
                   f"{', '.join(p.name for p in written)} → {outdir}")
 
