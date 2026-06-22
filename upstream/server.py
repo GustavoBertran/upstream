@@ -1136,7 +1136,7 @@ function downloadSelectionCSV() {
     lines.push(vals.join(","));
   }
 
-  var blob = new Blob([lines.join("\n")], {type:"text/csv"});
+  var blob = new Blob([lines.join("\\n")], {type:"text/csv"});
   var url = URL.createObjectURL(blob);
   var a = document.createElement("a");
   a.href = url; a.download = "geo_selection.csv";
