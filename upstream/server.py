@@ -489,6 +489,12 @@ input:checked+.slider::before{transform:translateX(14px)}
 .facet-item{display:flex;align-items:center;gap:.4rem;padding:.2rem .65rem;font-size:.74rem}
 .facet-item:hover{background:var(--bg3)}
 .facet-count{margin-left:auto;font-size:.64rem;color:var(--dim)}
+/* GEO selection summary */
+.geo-summary-hdr{display:flex;align-items:center;justify-content:space-between;
+                  margin:.8rem 0 .4rem;padding-top:.6rem;border-top:1px solid var(--border)}
+.geo-summary-hdr span{font-size:.78rem;color:var(--dim)}
+.grp-disease{color:var(--red)}
+.grp-control{color:var(--cyan)}
 </style>
 </head>
 <body>
@@ -580,6 +586,23 @@ input:checked+.slider::before{transform:translateX(14px)}
             <tbody id="geo-tbody"></tbody>
           </table>
         </div>
+        <!-- Selection summary (appears once any group is assigned) -->
+        <div id="geo-summary" style="display:none">
+          <div class="geo-summary-hdr">
+            <span id="geo-summary-title"></span>
+            <button class="btn ghost" onclick="resetGeoGroups()"
+                    style="font-size:.72rem;padding:.25rem .65rem">Reset groups</button>
+          </div>
+          <div class="geo-table-wrap">
+            <table class="geo-table">
+              <thead>
+                <tr><th>Sample (GSM)</th><th>Title</th><th>Group</th><th>SRR</th></tr>
+              </thead>
+              <tbody id="geo-summary-tbody"></tbody>
+            </table>
+          </div>
+        </div>
+
         <div class="geo-dl-row">
           <div class="field" style="max-width:280px">
             <label>Output directory</label>
@@ -962,7 +985,10 @@ function renderGeoTable() {
       if (v === row.group) opt.selected = true;
       sel.appendChild(opt);
     });
-    (function(r){ sel.onchange = function(){ r.group = sel.value; }; })(row);
+    // Capture both row ref AND this specific select element in the closure.
+    // Using a bare `sel` variable (var-scoped) would read the LAST select
+    // created in the loop once onchange fires — hence the second argument `s`.
+    (function(r, s){ s.onchange = function(){ r.group = s.value; renderSummaryTable(); }; })(row, sel);
     tdGrp.appendChild(sel); tr.appendChild(tdGrp);
     var tdS = document.createElement("td");
     tdS.id = "srr-"+row.gsm;
@@ -976,6 +1002,50 @@ function renderGeoTable() {
     tr.appendChild(tdS);
     tbody.appendChild(tr);
   }
+  renderSummaryTable();
+}
+
+function renderSummaryTable() {
+  var summaryDiv = document.getElementById("geo-summary");
+  if (!summaryDiv) return;
+  // Use all rows (not just filtered view) for the summary
+  var selected = _geoRows.filter(function(r){ return r.group !== "skip"; });
+  if (selected.length === 0) { summaryDiv.style.display = "none"; return; }
+  var disease = selected.filter(function(r){ return r.group === "disease"; }).length;
+  var control = selected.filter(function(r){ return r.group === "control"; }).length;
+  document.getElementById("geo-summary-title").textContent =
+    selected.length + " sample" + (selected.length===1?"":"s") + " selected — " +
+    disease + " disease, " + control + " control";
+  var tbody = document.getElementById("geo-summary-tbody");
+  tbody.innerHTML = "";
+  for (var i = 0; i < selected.length; i++) {
+    var row = selected[i];
+    var tr = document.createElement("tr");
+    var td1 = document.createElement("td");
+    td1.style.cssText = "font-family:monospace;font-size:.72rem";
+    td1.textContent = row.gsm; tr.appendChild(td1);
+    var td2 = document.createElement("td");
+    td2.textContent = row.title; tr.appendChild(td2);
+    var td3 = document.createElement("td");
+    td3.textContent = row.group;
+    td3.className = row.group === "disease" ? "grp-disease" : "grp-control";
+    tr.appendChild(td3);
+    var td4 = document.createElement("td");
+    if (row.srr === null) {
+      td4.innerHTML = '<span class="spin" style="font-size:.8rem">&#8635;</span>';
+    } else {
+      td4.textContent = row.srr || "not found";
+      if (!row.srr) td4.className = "srr-err";
+    }
+    tr.appendChild(td4);
+    tbody.appendChild(tr);
+  }
+  summaryDiv.style.display = "";
+}
+
+function resetGeoGroups() {
+  for (var i = 0; i < _geoRows.length; i++) { _geoRows[i].group = "disease"; }
+  renderGeoTable();  // re-renders dropdowns from _geoRows (summary re-renders inside)
 }
 
 async function fetchGSE() {
@@ -990,6 +1060,8 @@ async function fetchGSE() {
   _geoSortCol = null; _geoSortAsc = true;
   var panel = document.getElementById("geo-facets");
   if (panel) { panel.innerHTML = ""; panel.style.display = "none"; }
+  var sumDiv = document.getElementById("geo-summary");
+  if (sumDiv) sumDiv.style.display = "none";
   try {
     var res = await fetch("/api/geo/"+gse);
     var data = await res.json();
@@ -1047,6 +1119,7 @@ async function fetchGSE() {
               td.textContent = "not found"; td.className = "srr-err";
             }
           }
+          renderSummaryTable();
         });
     })).then(function(){ geoMsg(""); });
 
