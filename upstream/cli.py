@@ -45,6 +45,8 @@ OutdirOpt  = Annotated[Path, typer.Option("--outdir",  help="Output directory (c
 ThreadsOpt = Annotated[int,  typer.Option("--threads", help="CPU threads for tools that support it")]
 ExplainOpt = Annotated[bool, typer.Option("--explain/--no-explain",
                                            help="Show educational explanations (on by default)")]
+DryRunOpt  = Annotated[bool, typer.Option("--dry-run",
+                                          help="Print the commands each step would run, without executing.")]
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────
@@ -58,8 +60,13 @@ def _read_samplesheet(path: Path, allow_input: bool = False) -> list[dict[str, s
         return list(csv.DictReader(f))
 
 
-def _require_tools(track: str, **opts) -> None:
-    """Fail fast with a clear message if a track's tools aren't on PATH."""
+def _require_tools(track: str, dry: bool = False, **opts) -> None:
+    """Fail fast with a clear message if a track's tools aren't on PATH.
+
+    Skipped under --dry-run, which previews commands without needing the tools.
+    """
+    if dry:
+        return
     missing = preflight.missing_tools(preflight.required_tools(track, **opts))
     if missing:
         _die(
@@ -111,6 +118,11 @@ def _build_peak_outputs(
     per-peak read counts (deeptools multiBamSummary) → counts_matrix.csv + coldata.csv
     for DESeq2/edgeR. 'both' → both.
     """
+    if runner.DRY_RUN:
+        console.print(f"[yellow][dry-run][/yellow] would build '{output_format}' output(s) "
+                      f"in {outdir} (consensus peaks + multiBamSummary counts / OBAMA matrix).")
+        return []
+
     written: list[Path] = []
 
     if output_format in ("obama", "both"):
@@ -163,6 +175,8 @@ def _require_dir(path: Path, label: str) -> None:
 
 
 def _check(ok: bool, msg: str) -> None:
+    if runner.DRY_RUN:
+        return  # nothing was produced to validate
     if ok:
         runner.ok(msg)
     else:
@@ -188,10 +202,12 @@ def qc(
     outdir: OutdirOpt,
     threads: ThreadsOpt = 4,
     explain: ExplainOpt = True,
+    dry_run: DryRunOpt = False,
 ) -> None:
     """FastQC + MultiQC quality control on all samples in the samplesheet."""
     sample_list = _read_samplesheet(samples)
-    _require_tools("qc")
+    _require_tools("qc", dry=dry_run)
+    runner.DRY_RUN = dry_run
     outdir.mkdir(parents=True, exist_ok=True)
     console.print(f"\n[bold]QC pipeline[/bold] — {len(sample_list)} sample(s) → {outdir}\n")
 
@@ -254,6 +270,7 @@ def rnaseq(
     )] = None,
     threads: ThreadsOpt = 4,
     explain: ExplainOpt = True,
+    dry_run: DryRunOpt = False,
 ) -> None:
     """RNA-seq: trim (fastp) → align/quantify (STAR or Salmon) → counts matrix.
 
@@ -280,11 +297,12 @@ def rnaseq(
         _die(f"tx2gene file not found: {tx2gene}")
 
     sample_list = _read_samplesheet(samples)
-    _require_tools("rnaseq", aligner=aligner, output_format=output_format)
+    _require_tools("rnaseq", dry=dry_run, aligner=aligner, output_format=output_format)
     if aligner == "salmon":
         _require_dir(salmon_index, "Salmon index")
     else:
         _require_dir(star_index, "STAR index")
+    runner.DRY_RUN = dry_run
     outdir.mkdir(parents=True, exist_ok=True)
 
     TOTAL = 3
@@ -368,6 +386,11 @@ def rnaseq(
 
     # 3 — Build output matrices (OBAMA and/or DESeq2/edgeR/limma matrix)
     runner.step_header("Build matrix output", 3, TOTAL)
+    if dry_run:
+        console.print(f"[yellow][dry-run][/yellow] would build '{output_format}' output(s) "
+                      f"from {len(result_dirs)} sample(s) → {outdir}")
+        console.print("\n[bold green]Dry run complete.[/bold green] No tools were executed.")
+        return
     if explain and output_format in ("matrix", "both"):
         _explain("rnaseq_export_formats.md")
 
@@ -403,7 +426,10 @@ def rnaseq(
     if output_format in ("matrix", "both"):
         _check(*checkpoints.check_counts_matrix(outdir / "counts_matrix.csv", outdir / "coldata.csv"))
 
-    console.print(f"\n[bold green]Done.[/bold green] Wrote: {', '.join(p.name for p in written)} → {outdir}")
+    if dry_run:
+        console.print("\n[bold green]Dry run complete.[/bold green] No tools were executed.")
+    else:
+        console.print(f"\n[bold green]Done.[/bold green] Wrote: {', '.join(p.name for p in written)} → {outdir}")
 
 
 # ── ATAC-seq ──────────────────────────────────────────────────────────────
@@ -421,6 +447,7 @@ def atacseq(
     )] = "obama",
     threads: ThreadsOpt = 4,
     explain: ExplainOpt = True,
+    dry_run: DryRunOpt = False,
 ) -> None:
     """ATAC-seq: QC → trim (fastp) → align (Bowtie2) → filter → peaks (MACS2) → matrix.
 
@@ -432,8 +459,9 @@ def atacseq(
     if output_format not in ("obama", "matrix", "both"):
         _die("--format must be 'obama', 'matrix', or 'both'.")
     sample_list = _read_samplesheet(samples)
-    _require_tools("atacseq", output_format=output_format)
+    _require_tools("atacseq", dry=dry_run, output_format=output_format)
     bt2_prefix = bowtie2_index  # e.g. /ref/bowtie2/hg38 (no .bt2 extension)
+    runner.DRY_RUN = dry_run
     outdir.mkdir(parents=True, exist_ok=True)
 
     TOTAL = 5
@@ -539,7 +567,10 @@ def atacseq(
     runner.step_header("Build matrix output", 5, TOTAL)
     written = _build_peak_outputs(atac_results, outdir, output_format, threads,
                                   explain, "atacseq_export_formats.md")
-    console.print(f"\n[bold green]Done.[/bold green] Wrote: {', '.join(p.name for p in written)} → {outdir}")
+    if dry_run:
+        console.print("\n[bold green]Dry run complete.[/bold green] No tools were executed.")
+    else:
+        console.print(f"\n[bold green]Done.[/bold green] Wrote: {', '.join(p.name for p in written)} → {outdir}")
 
 
 # ── ChIP-seq ─────────────────────────────────────────────────────────────────
@@ -562,6 +593,7 @@ def chipseq(
     )] = "matrix",
     threads: ThreadsOpt = 4,
     explain: ExplainOpt = True,
+    dry_run: DryRunOpt = False,
 ) -> None:
     """ChIP-seq: fastp → Bowtie2 → filter → MACS2 (optional input control) → matrix.
 
@@ -589,8 +621,9 @@ def chipseq(
         if ctl and ctl not in inputs:
             _die(f"control '{ctl}' for sample '{s['name']}' must name a group=input row.")
 
-    _require_tools("chipseq", output_format=output_format)
+    _require_tools("chipseq", dry=dry_run, output_format=output_format)
     bt2_prefix = bowtie2_index
+    runner.DRY_RUN = dry_run
     outdir.mkdir(parents=True, exist_ok=True)
 
     TOTAL = 5
@@ -697,7 +730,10 @@ def chipseq(
     runner.step_header("Build matrix output", 5, TOTAL)
     written = _build_peak_outputs(chip_results, outdir, output_format, threads,
                                   explain, "chipseq_export_formats.md")
-    console.print(f"\n[bold green]Done.[/bold green] Wrote: {', '.join(p.name for p in written)} → {outdir}")
+    if dry_run:
+        console.print("\n[bold green]Dry run complete.[/bold green] No tools were executed.")
+    else:
+        console.print(f"\n[bold green]Done.[/bold green] Wrote: {', '.join(p.name for p in written)} → {outdir}")
 
 
 # ── Methylation ────────────────────────────────────────────────────────────
@@ -723,6 +759,7 @@ def methylation(
     )] = "obama",
     threads: ThreadsOpt = 4,
     explain: ExplainOpt = True,
+    dry_run: DryRunOpt = False,
 ) -> None:
     """Methylation: WGBS (Bismark pipeline) or Illumina array (450K/EPIC beta matrix from GEO).
 
@@ -735,6 +772,7 @@ def methylation(
     if output_format not in ("obama", "matrix", "both"):
         _die("--format must be 'obama', 'matrix', or 'both'.")
 
+    runner.DRY_RUN = dry_run
     outdir.mkdir(parents=True, exist_ok=True)
 
     if method == "array":
@@ -755,6 +793,11 @@ def methylation(
             if output_format in ("matrix", "both"):
                 _explain("methylation_export_formats.md")
 
+        if dry_run:
+            console.print(f"[yellow][dry-run][/yellow] would merge betas + metadata into "
+                          f"'{output_format}' output(s) → {outdir} (no external tools run).")
+            console.print("\n[bold green]Dry run complete.[/bold green]")
+            return
         try:
             written = obama.write_methylation_array_outputs(betas, metadata, outdir, output_format)
         except ValueError as e:
@@ -773,7 +816,7 @@ def methylation(
     if not bismark_genome:
         _die("--bismark-genome is required for --method wgbs.")
     sample_list = _read_samplesheet(samples)
-    _require_tools("methylation", method="wgbs")
+    _require_tools("methylation", dry=dry_run, method="wgbs")
     _require_dir(bismark_genome, "Bismark genome directory")
 
     TOTAL = 4
@@ -827,15 +870,18 @@ def methylation(
         # Resolve Bismark's output by globbing rather than hardcoding: the exact
         # name depends on the Bismark version and whether --basename strips the
         # "_bismark_bt2" tag. PE emits *_pe.bam/*_PE_report.txt; SE *.bam/*_SE_report.txt.
-        bam_glob = "*_pe.bam" if paired else "*.bam"
-        rep_glob = "*_PE_report.txt" if paired else "*_SE_report.txt"
-        bams = sorted(bismark_dir.glob(f"{name}{bam_glob}")) or sorted(bismark_dir.glob(bam_glob))
-        reps = sorted(bismark_dir.glob(f"{name}*{rep_glob[1:]}")) or sorted(bismark_dir.glob(rep_glob))
-        if not bams:
-            _die(f"Bismark BAM not found in {bismark_dir} for sample '{name}'.")
-        bam = bams[0]
-        report = reps[0] if reps else None
-        _check(*checkpoints.check_bismark_bam(bam, report))
+        if dry_run:
+            bam = bismark_dir / f"{name}_bismark_bt2{'_pe' if paired else ''}.bam"  # expected (not resolved)
+        else:
+            bam_glob = "*_pe.bam" if paired else "*.bam"
+            rep_glob = "*_PE_report.txt" if paired else "*_SE_report.txt"
+            bams = sorted(bismark_dir.glob(f"{name}{bam_glob}")) or sorted(bismark_dir.glob(bam_glob))
+            reps = sorted(bismark_dir.glob(f"{name}*{rep_glob[1:]}")) or sorted(bismark_dir.glob(rep_glob))
+            if not bams:
+                _die(f"Bismark BAM not found in {bismark_dir} for sample '{name}'.")
+            bam = bams[0]
+            report = reps[0] if reps else None
+            _check(*checkpoints.check_bismark_bam(bam, report))
 
         # 3 — Methylation extraction
         runner.step_header("Methylation extraction — bismark_methylation_extractor", 3, TOTAL)
@@ -856,18 +902,26 @@ def methylation(
         if rc != 0:
             _die(f"bismark_methylation_extractor failed for sample '{name}'.")
 
-        cx_files = list(methyl_dir.glob(f"{name}*.CX_report.txt"))
-        if not cx_files:
-            cx_files = list(methyl_dir.glob("*.CX_report.txt"))
-        if not cx_files:
-            _die(f"CX cytosine report not found in {methyl_dir} for sample '{name}'.")
-        cx_report = cx_files[0]
-        _check(*checkpoints.check_methylation_cx_report(cx_report))
+        if dry_run:
+            cx_report = methyl_dir / f"{name}.CX_report.txt"  # expected (not resolved)
+        else:
+            cx_files = list(methyl_dir.glob(f"{name}*.CX_report.txt"))
+            if not cx_files:
+                cx_files = list(methyl_dir.glob("*.CX_report.txt"))
+            if not cx_files:
+                _die(f"CX cytosine report not found in {methyl_dir} for sample '{name}'.")
+            cx_report = cx_files[0]
+            _check(*checkpoints.check_methylation_cx_report(cx_report))
 
         cx_reports.append((name, group, cx_report))
 
     # 4 — Build output matrices (OBAMA percent-methylation and/or limma M-values)
     runner.step_header("Build matrix output", 4, TOTAL)
+    if dry_run:
+        console.print(f"[yellow][dry-run][/yellow] would build '{output_format}' output(s) "
+                      f"from {len(cx_reports)} sample(s) → {outdir}")
+        console.print("\n[bold green]Dry run complete.[/bold green] No tools were executed.")
+        return
     if explain and output_format in ("matrix", "both"):
         _explain("methylation_export_formats.md")
     written = obama.write_methylation_outputs(cx_reports, outdir, output_format)

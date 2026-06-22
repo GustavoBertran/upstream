@@ -7,10 +7,18 @@ from rich.rule import Rule
 
 console = Console()
 
+# When True, run()/pipe() print the command they WOULD run and return 0 without
+# executing anything. Set by the CLI's --dry-run flag (and the web "show commands"
+# toggle, via --dry-run). Lets students preview the exact tool invocations.
+DRY_RUN = False
+
 
 def run(cmd: list[str], cwd: Path | None = None) -> int:
     """Stream a command's stdout/stderr to the terminal. Returns the exit code."""
     display = " \\\n  ".join(str(c) for c in cmd)
+    if DRY_RUN:
+        console.print(f"\n[yellow][dry-run][/yellow] [dim]$ {display}[/dim]")
+        return 0
     console.print(f"\n[dim]$ {display}[/dim]\n")
     result = subprocess.run(
         [str(c) for c in cmd],
@@ -25,6 +33,9 @@ def pipe(cmd_a: list[str], cmd_b: list[str], cwd: Path | None = None) -> int:
     """Run cmd_a | cmd_b, streaming stderr of both. Returns cmd_b exit code."""
     display_a = " ".join(str(c) for c in cmd_a)
     display_b = " ".join(str(c) for c in cmd_b)
+    if DRY_RUN:
+        console.print(f"\n[yellow][dry-run][/yellow] [dim]$ {display_a} | {display_b}[/dim]")
+        return 0
     console.print(f"\n[dim]$ {display_a} \\\n  | {display_b}[/dim]\n")
     p_a = subprocess.Popen(
         [str(c) for c in cmd_a],

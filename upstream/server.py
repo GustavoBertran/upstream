@@ -50,6 +50,7 @@ class RunRequest(BaseModel):
     outdir: str = "results/"
     threads: int = 4
     explain: bool = True
+    dry_run: bool = False
     # rnaseq aligner choice
     aligner: Optional[str] = None
     # rnaseq output format + gene-level aggregation
@@ -164,6 +165,8 @@ def _build_cmd(req: RunRequest) -> list[str]:
             cmd += ["--format", req.output_format]
         if not req.explain:
             cmd.append("--no-explain")
+        if req.dry_run:
+            cmd.append("--dry-run")
         return cmd
 
     cmd = _upstream_argv() + [
@@ -195,6 +198,8 @@ def _build_cmd(req: RunRequest) -> list[str]:
             cmd += ["--tx2gene", req.tx2gene]
     if req.track == "chipseq" and req.peak_type:
         cmd += ["--peak-type", req.peak_type]
+    if req.dry_run:
+        cmd.append("--dry-run")
     return cmd
 
 
@@ -757,6 +762,15 @@ input:checked+.slider::before{transform:translateX(14px)}
             <span class="slider"></span>
           </label>
           <span style="font-size:.825rem">Show step explanations</span>
+        </div>
+      </div>
+      <div class="field full">
+        <div class="toggle-row">
+          <label class="toggle">
+            <input type="checkbox" id="inp-dryrun">
+            <span class="slider"></span>
+          </label>
+          <span style="font-size:.825rem">Dry run — print the commands, run nothing</span>
         </div>
       </div>
     </div>
@@ -1548,7 +1562,8 @@ async function startRun() {
   const outdir  = document.getElementById("inp-outdir").value.trim() || "results/";
   const threads = parseInt(document.getElementById("inp-threads").value) || 4;
   const explain = document.getElementById("inp-explain").checked;
-  const body = {track:track, outdir:outdir, threads:threads, explain:explain};
+  const dryRun  = (document.getElementById("inp-dryrun") || {checked:false}).checked;
+  const body = {track:track, outdir:outdir, threads:threads, explain:explain, dry_run:dryRun};
 
   if (TRACKS[track].isMethylation) {
     const method = (document.getElementById("inp-meth-method") || {value:"wgbs"}).value;
