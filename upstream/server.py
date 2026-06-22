@@ -505,6 +505,18 @@ input:checked+.slider::before{transform:translateX(14px)}
 .geo-summary-hdr span{font-size:.78rem;color:var(--dim)}
 .grp-disease{color:var(--red)}
 .grp-control{color:var(--cyan)}
+/* CSV column selector */
+.csv-export-hdr{display:flex;align-items:center;justify-content:space-between;
+                padding-top:.55rem;margin-top:.6rem;border-top:1px solid var(--border)}
+.csv-export-hdr>span{font-size:.76rem;color:var(--dim)}
+#geo-csv-cols{display:flex;flex-wrap:wrap;gap:.3rem;margin-top:.4rem}
+.csv-col-tag{display:inline-flex;align-items:center;gap:.28rem;background:var(--bg3);
+             border:1px solid var(--border);border-radius:4px;
+             padding:.18rem .5rem;font-size:.7rem;cursor:pointer;user-select:none;
+             transition:border-color .12s,color .12s}
+.csv-col-tag input[type=checkbox]{width:11px;height:11px;margin:0;cursor:pointer;
+                                   accent-color:var(--accent)}
+.csv-col-tag.checked{border-color:var(--accent);color:var(--bright)}
 </style>
 </head>
 <body>
@@ -610,6 +622,15 @@ input:checked+.slider::before{transform:translateX(14px)}
               </thead>
               <tbody id="geo-summary-tbody"></tbody>
             </table>
+          </div>
+          <!-- CSV export -->
+          <div id="geo-csv-export" style="display:none">
+            <div class="csv-export-hdr">
+              <span>Export columns:</span>
+              <button class="btn ghost" onclick="downloadSelectionCSV()"
+                      style="font-size:.73rem;padding:.25rem .75rem">&#8595; Download CSV</button>
+            </div>
+            <div id="geo-csv-cols"></div>
           </div>
         </div>
 
@@ -1020,7 +1041,12 @@ function renderSummaryTable() {
   if (!summaryDiv) return;
   // Use all rows (not just filtered view) for the summary
   var selected = _geoRows.filter(function(r){ return r.group !== "skip"; });
-  if (selected.length === 0) { summaryDiv.style.display = "none"; return; }
+  if (selected.length === 0) {
+    summaryDiv.style.display = "none";
+    var expDiv = document.getElementById("geo-csv-export");
+    if (expDiv) expDiv.style.display = "none";
+    return;
+  }
   var disease = selected.filter(function(r){ return r.group === "disease"; }).length;
   var control = selected.filter(function(r){ return r.group === "control"; }).length;
   document.getElementById("geo-summary-title").textContent =
@@ -1051,6 +1077,72 @@ function renderSummaryTable() {
     tbody.appendChild(tr);
   }
   summaryDiv.style.display = "";
+  _buildCSVSelector();
+}
+
+function _buildCSVSelector() {
+  var exportDiv = document.getElementById("geo-csv-export");
+  var container = document.getElementById("geo-csv-cols");
+  if (!exportDiv || !container) return;
+
+  // Fixed columns always available; characteristic columns added after metadata loads
+  var cols = ["gsm", "title", "group", "srr"].concat(_geoCharKeys);
+  var colLabels = {gsm:"Sample (GSM)", title:"Title", group:"Group", srr:"SRR"};
+
+  // Preserve any existing checked state the user set
+  var prevChecked = {};
+  container.querySelectorAll("input[type=checkbox]").forEach(function(cb){
+    prevChecked[cb.value] = cb.checked;
+  });
+
+  container.innerHTML = "";
+  for (var i = 0; i < cols.length; i++) {
+    var col = cols[i];
+    var lbl = document.createElement("label");
+    lbl.className = "csv-col-tag";
+    var cb = document.createElement("input");
+    cb.type = "checkbox";
+    cb.value = col;
+    // Default: checked; restore user's previous choice if it exists
+    cb.checked = (col in prevChecked) ? prevChecked[col] : true;
+    if (cb.checked) lbl.classList.add("checked");
+    (function(c, l){ c.onchange = function(){ l.classList.toggle("checked", c.checked); }; })(cb, lbl);
+    lbl.appendChild(cb);
+    lbl.appendChild(document.createTextNode(" "+(colLabels[col] || col)));
+    container.appendChild(lbl);
+  }
+  exportDiv.style.display = "";
+}
+
+function downloadSelectionCSV() {
+  var selected = _geoRows.filter(function(r){ return r.group !== "skip"; });
+  if (!selected.length) return;
+
+  var cols = Array.from(
+    document.querySelectorAll("#geo-csv-cols input[type=checkbox]:checked")
+  ).map(function(cb){ return cb.value; });
+  if (!cols.length) return;
+
+  var colLabels = {gsm:"geo_accession", title:"title", group:"group", srr:"srr"};
+  var header = cols.map(function(c){ return colLabels[c] || c; });
+
+  var lines = [header.map(function(h){ return '"'+h.replace(/"/g,'""')+'"'; }).join(",")];
+  for (var i = 0; i < selected.length; i++) {
+    var row = selected[i];
+    var vals = cols.map(function(c){
+      var v = (c === "srr") ? (row.srr || "") : (row[c] || "");
+      return '"'+String(v).replace(/"/g,'""')+'"';
+    });
+    lines.push(vals.join(","));
+  }
+
+  var blob = new Blob([lines.join("\n")], {type:"text/csv"});
+  var url = URL.createObjectURL(blob);
+  var a = document.createElement("a");
+  a.href = url; a.download = "geo_selection.csv";
+  document.body.appendChild(a); a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
 }
 
 function resetGeoGroups() {
@@ -1107,7 +1199,7 @@ async function fetchGSE() {
         }
         _buildGeoHeader();
         _buildFacets();
-        renderGeoTable();
+        renderGeoTable();  // renderGeoTable calls renderSummaryTable which calls _buildCSVSelector
       })
       .catch(function(){});  // characteristics unavailable — proceed without them
 
