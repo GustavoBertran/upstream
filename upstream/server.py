@@ -28,6 +28,7 @@ from fastapi.responses import HTMLResponse, StreamingResponse
 from pydantic import BaseModel
 
 from . import preflight
+from .samplesheet import scan_fastq_dir
 
 _ANSI_RE = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]")
 
@@ -117,6 +118,27 @@ def _preflight_issues(req: "RunRequest") -> list[str]:
 def api_check(req: RunRequest) -> dict:
     """Pre-run validation for the web UI's Run gate. Returns {issues: [...]}."""
     return {"issues": _preflight_issues(req)}
+
+
+@app.get("/api/samplesheet")
+def api_samplesheet(dir: str) -> dict:
+    """Scan a folder of FASTQs and write a starter samples.csv into it."""
+    import csv as _csv
+    rows, warnings = scan_fastq_dir(dir)
+    if not rows:
+        return {"ok": False, "warnings": warnings, "path": None}
+    out_path = Path(dir) / "samples.csv"
+    with out_path.open("w", newline="") as f:
+        w = _csv.DictWriter(f, fieldnames=["name", "group", "r1", "r2"])
+        w.writeheader()
+        w.writerows(rows)
+    return {
+        "ok": True,
+        "path": str(out_path.resolve()),
+        "n": len(rows),
+        "paired": sum(1 for r in rows if r["r2"]),
+        "warnings": warnings,
+    }
 
 
 @app.post("/api/cancel/{run_id}")
@@ -740,6 +762,8 @@ input:checked+.slider::before{transform:translateX(14px)}
         <div class="field-row">
           <input id="inp-samples" type="text" placeholder="/data/upstream/shared/fastq/rnaseq/samples.csv">
           <button class="browse-btn" onclick="openBrowser('inp-samples','file')">...</button>
+          <button class="browse-btn" onclick="buildSamplesheet()"
+                  title="Generate samples.csv from a folder of FASTQ files">&#9881; from folder</button>
         </div>
         <div class="hint">Generate with: <code>upstream download --track &lt;track&gt; --outdir .</code></div>
       </div>
@@ -1719,6 +1743,7 @@ async function _kickoffRun(body, label, nsteps) {
 
 let _browserTarget = null;
 let _browserType   = "any";
+let _browserMode   = "path";   // "path" = fill an input; "sheet" = build samples.csv from a folder
 
 async function openBrowser(inputId, type) {
   _browserTarget = inputId;
@@ -1730,8 +1755,14 @@ async function openBrowser(inputId, type) {
   await navigateBrowser(start || "~");
 }
 
+function buildSamplesheet() {
+  _browserMode = "sheet";
+  openBrowser("inp-samples", "dir");  // pick the FASTQ folder; "Select this folder" builds it
+}
+
 function closeBrowser() {
   document.getElementById("browser-modal").classList.remove("open");
+  _browserMode = "path";
 }
 
 async function navigateBrowser(path) {
@@ -1771,8 +1802,25 @@ async function navigateBrowser(path) {
   }
 }
 
-function selectBrowserDir() {
+async function selectBrowserDir() {
   const path = document.getElementById("browser-path").dataset.path;
+  if (_browserMode === "sheet") {
+    closeBrowser();
+    if (!path) return;
+    err("");
+    try {
+      const d = await (await fetch("/api/samplesheet?dir=" + encodeURIComponent(path))).json();
+      if (d.ok) {
+        const el = document.getElementById("inp-samples");
+        if (el) el.value = d.path;
+        err("Wrote samples.csv — " + d.n + " sample(s), " + d.paired
+            + " paired. Now fill in the 'group' column (disease/control).");
+      } else {
+        err("No FASTQ files found in that folder.");
+      }
+    } catch (e) { err("Could not scan the folder."); }
+    return;
+  }
   if (path && _browserTarget) {
     const el = document.getElementById(_browserTarget);
     if (el) el.value = path;

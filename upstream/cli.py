@@ -29,6 +29,7 @@ from rich.markdown import Markdown
 from rich.panel import Panel
 
 from . import checkpoints, downloader, obama, preflight, runner
+from .samplesheet import scan_fastq_dir
 
 app = typer.Typer(
     name="htsprep",
@@ -932,6 +933,42 @@ def methylation(
 
     console.print(f"\n[bold green]Done.[/bold green] Wrote: "
                   f"{', '.join(p.name for p in written)} → {outdir}")
+
+
+# ── Samplesheet generation ───────────────────────────────────────────────────
+
+
+@app.command()
+def samplesheet(
+    directory: Annotated[Path, typer.Option("--dir", help="Folder of FASTQ files to scan.")],
+    out: Annotated[Optional[Path], typer.Option(
+        "--out", help="Where to write samples.csv (default: <dir>/samples.csv).")] = None,
+) -> None:
+    """Generate a starter samples.csv from a folder of FASTQ files.
+
+    Pairs R1/R2 mates, infers paired vs single-end, and derives sample names. The
+    'group' column is left blank — fill it with disease/control before running.
+    """
+    rows, warnings = scan_fastq_dir(directory)
+    for w in warnings:
+        console.print(f"[yellow]•[/yellow] {w}")
+    if not rows:
+        _die(f"No samples detected in {directory}.")
+
+    out_path = out or (Path(directory) / "samples.csv")
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with out_path.open("w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=["name", "group", "r1", "r2"])
+        writer.writeheader()
+        writer.writerows(rows)
+
+    n_pe = sum(1 for r in rows if r["r2"])
+    console.print(
+        f"\n[bold green]✓ Wrote {out_path}[/bold green] — {len(rows)} sample(s) "
+        f"({n_pe} paired-end, {len(rows) - n_pe} single-end)."
+    )
+    console.print("[dim]Next: fill in the 'group' column (disease/control), then run a track "
+                  "(or 'upstream check').[/dim]")
 
 
 # ── Check (preflight) ────────────────────────────────────────────────────────
