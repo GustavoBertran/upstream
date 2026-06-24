@@ -170,6 +170,50 @@ def fetch_srr_all(gse: str) -> dict[str, str]:
     return gsm_to_srr
 
 
+def supplementary_base_url(gse: str) -> str:
+    """FTP directory holding a GEO series' supplementary files."""
+    gse = gse.strip().upper()
+    digits = gse[3:]
+    prefix = digits[:-3] + "nnn" if len(digits) > 3 else digits
+    return f"https://ftp.ncbi.nlm.nih.gov/geo/series/GSE{prefix}/{gse}/suppl/"
+
+
+def fetch_supplementary_files(gse: str) -> dict:
+    """List a GEO series' supplementary files — the source of intensity/beta matrices.
+
+    Proteomics intensity matrices and 450K/EPIC beta matrices are deposited as GEO
+    *supplementary* files (not in SRA), so this is the matrix-track analogue of the
+    SRR-based FASTQ download. Returns {gse, base_url, files: [{name, url}]}.
+
+    Raises ValueError if the accession is malformed or no files are listed.
+    """
+    gse = gse.strip().upper()
+    if not gse.startswith("GSE"):
+        raise ValueError(f"Expected a GSE accession (e.g. GSE12345), got: {gse!r}")
+    base = supplementary_base_url(gse)
+    time.sleep(_DELAY)
+    try:
+        with urllib.request.urlopen(base, timeout=30) as r:
+            html = r.read().decode("utf-8", errors="replace")
+    except Exception as e:  # noqa: BLE001 — surface a friendly message
+        raise ValueError(f"Could not list supplementary files for {gse}: {e}")
+
+    files: list[dict] = []
+    seen: set[str] = set()
+    for m in re.finditer(r'href="([^"?]+)"', html):
+        name = m.group(1)
+        # skip parent/sort links, subdirectories, and the non-data file index
+        if name.startswith(("/", "http", "?")) or name.endswith("/") or name == "filelist.txt":
+            continue
+        if name in seen:
+            continue
+        seen.add(name)
+        files.append({"name": name, "url": base + name})
+    if not files:
+        raise ValueError(f"No supplementary files found for {gse}.")
+    return {"gse": gse, "base_url": base, "files": files}
+
+
 def fetch_characteristics(gse: str) -> dict:
     """Return sample characteristics from the GEO series matrix file.
 

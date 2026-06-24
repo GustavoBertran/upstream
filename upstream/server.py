@@ -64,6 +64,10 @@ class RunRequest(BaseModel):
     data_track: Optional[str] = None
     # geo download
     geo_samples: Optional[list] = None
+    reads: Optional[int] = None            # subsample target; 0/None for the default, <0 for all reads
+    # geo supplementary-matrix download (proteomics / methylation array)
+    suppl_url: Optional[str] = None
+    suppl_name: Optional[str] = None
     # track-specific index paths
     star_index: Optional[str] = None
     salmon_index: Optional[str] = None
@@ -73,6 +77,17 @@ class RunRequest(BaseModel):
     method: Optional[str] = None
     betas: Optional[str] = None
     metadata_csv: Optional[str] = None
+    # genomics
+    reference: Optional[str] = None
+    merge: Optional[bool] = None
+    min_mapq: Optional[int] = None
+    min_baseq: Optional[int] = None
+    # proteomics
+    intensities: Optional[str] = None
+    input_type: Optional[str] = None
+    intensity_col: Optional[str] = None
+    min_valid: Optional[float] = None
+    normalize: Optional[str] = None
 
 
 # ── Routes ────────────────────────────────────────────────────────────────
@@ -101,6 +116,8 @@ def stream(run_id: str) -> StreamingResponse:
 
 
 def _preflight_issues(req: "RunRequest") -> list[str]:
+    if req.track == "download_suppl":
+        return []  # pure HTTP fetch — nothing to preflight
     if req.track == "download_geo":
         return [f"tool: '{t}' not found on PATH (activate the environment?)"
                 for t in preflight.missing_tools(preflight.required_tools("download_geo"))]
@@ -110,6 +127,7 @@ def _preflight_issues(req: "RunRequest") -> list[str]:
         aligner=req.aligner, method=req.method, output_format=req.output_format,
         salmon_index=req.salmon_index, star_index=req.star_index,
         bismark_genome=req.bismark_genome,
+        reference=req.reference, intensities=req.intensities,
         betas=req.betas, metadata=req.metadata_csv,
     )
 
@@ -197,6 +215,26 @@ def _build_cmd(req: RunRequest) -> list[str]:
             cmd.append("--dry-run")
         return cmd
 
+    # Proteomics takes an intensity matrix + metadata, NOT a samplesheet — handle it
+    # before the generic samplesheet branch (which hard-requires --samples).
+    if req.track == "proteomics":
+        cmd = _upstream_argv() + [
+            "proteomics",
+            "--intensities", req.intensities or "",
+            "--metadata",    req.metadata_csv or "",
+            "--outdir",      req.outdir,
+            "--input-type",  req.input_type or "maxquant",
+            "--intensity-col", req.intensity_col or "LFQ",
+            "--normalize",   req.normalize or "median",
+        ]
+        if req.min_valid is not None:
+            cmd += ["--min-valid", str(req.min_valid)]
+        if not req.explain:
+            cmd.append("--no-explain")
+        if req.dry_run:
+            cmd.append("--dry-run")
+        return cmd
+
     cmd = _upstream_argv() + [
         req.track,
         "--samples", req.samples,
@@ -226,6 +264,15 @@ def _build_cmd(req: RunRequest) -> list[str]:
             cmd += ["--tx2gene", req.tx2gene]
     if req.track == "chipseq" and req.peak_type:
         cmd += ["--peak-type", req.peak_type]
+    if req.track == "genomics":
+        if req.reference:
+            cmd += ["--reference", req.reference]
+        if req.merge is False:
+            cmd.append("--no-merge")
+        if req.min_mapq is not None:
+            cmd += ["--min-mapq", str(req.min_mapq)]
+        if req.min_baseq is not None:
+            cmd += ["--min-baseq", str(req.min_baseq)]
     if req.dry_run:
         cmd.append("--dry-run")
     return cmd
@@ -234,6 +281,9 @@ def _build_cmd(req: RunRequest) -> list[str]:
 def _run_pipeline(run_id: str, req: RunRequest) -> None:
     if req.track == "download_geo":
         _run_geo_download(run_id, req)
+        return
+    if req.track == "download_suppl":
+        _run_suppl_download(run_id, req)
         return
 
     run = _runs[run_id]
@@ -270,7 +320,10 @@ def _run_geo_download(run_id: str, req: RunRequest) -> None:
     outdir  = Path(req.outdir)
     outdir.mkdir(parents=True, exist_ok=True)
     samples = req.geo_samples or []
-    nreads  = 1_000_000
+    # reads: <0 → keep all reads (needed for variant calling, where 1M reads is far too
+    # little coverage); >0 → that many; None/0 → the teaching default.
+    full_reads = req.reads is not None and req.reads < 0
+    nreads = req.reads if (req.reads and req.reads > 0) else 1_000_000
     workers = min(4, len(samples)) or 1
 
     def append(text: str, cls: str = "out") -> None:
@@ -281,7 +334,8 @@ def _run_geo_download(run_id: str, req: RunRequest) -> None:
         with _runs_lock:
             return run["status"] == "cancelled"
 
-    missing = [t for t in ("prefetch", "fasterq-dump", "seqtk") if shutil.which(t) is None]
+    needed = ["prefetch", "fasterq-dump"] + ([] if full_reads else ["seqtk"])
+    missing = [t for t in needed if shutil.which(t) is None]
     if missing:
         append(f"✗ Required tool(s) not found on PATH: {', '.join(missing)}. "
                f"Activate the environment (conda activate upstream) and retry.", "error")
@@ -316,6 +370,11 @@ def _run_geo_download(run_id: str, req: RunRequest) -> None:
         return hits[0] if hits else None
 
     def subsample(src: Path, dest: Path) -> bool:
+        if full_reads:                       # keep every read — just compress
+            with dest.open("wb") as fh:
+                p = subprocess.Popen(["gzip", "-c", str(src)], stdout=fh)
+                p.wait()
+            return p.returncode == 0
         p1 = subprocess.Popen(["seqtk", "sample", "-s", "42", str(src), str(nreads)],
                               stdout=subprocess.PIPE)
         with dest.open("wb") as fh:
@@ -372,7 +431,8 @@ def _run_geo_download(run_id: str, req: RunRequest) -> None:
                 return {**base, "ok": False}
 
             # 3 — subsample + compress
-            append(f"[{name}] subsampling to {nreads:,} reads ({layout})…")
+            append(f"[{name}] " + (f"compressing full read set ({layout})…" if full_reads
+                    else f"subsampling to {nreads:,} reads ({layout})…"))
             for src, dest in jobs:
                 if cancelled():
                     return {**base, "ok": False}
@@ -390,7 +450,8 @@ def _run_geo_download(run_id: str, req: RunRequest) -> None:
             shutil.rmtree(sra_dir, ignore_errors=True)
 
     append(f"Downloading {len(samples)} sample(s), {workers} in parallel "
-           f"(prefetch → fasterq-dump → subsample)…", "step")
+           f"(prefetch → fasterq-dump → "
+           f"{'full reads' if full_reads else f'subsample {nreads:,}'})…", "step")
 
     results: list[dict] = []
     with _futures.ThreadPoolExecutor(max_workers=workers) as ex:
@@ -427,6 +488,90 @@ def _run_geo_download(run_id: str, req: RunRequest) -> None:
                "on single-end data is a separate step.", "out")
     append("Done. Run the pipeline with:", "success")
     append(f"  upstream rnaseq --samples {csv_path} --outdir results/", "cmd")
+    with _runs_lock:
+        run["status"] = "done"; run["exit_code"] = 0
+
+
+def _run_suppl_download(run_id: str, req: RunRequest) -> None:
+    """Download a GEO supplementary file (or any direct URL) → outdir; gunzip if needed.
+
+    The matrix-track download (proteomics intensity matrix, methylation-array beta
+    matrix) — a plain HTTP fetch, no SRA tools. The matrix parsers aren't gzip-aware,
+    so a .gz download is decompressed to the file the pipeline expects.
+    """
+    import gzip as _gzip
+    import urllib.request as _u
+
+    run = _runs[run_id]
+    outdir = Path(req.outdir or "data")
+    outdir.mkdir(parents=True, exist_ok=True)
+
+    def append(text: str, cls: str = "out") -> None:
+        with _runs_lock:
+            run["lines"].append({"text": text, "cls": cls})
+
+    def cancelled() -> bool:
+        with _runs_lock:
+            return run["status"] == "cancelled"
+
+    url = (req.suppl_url or "").strip()
+    if not url:
+        append("✗ No file URL provided.", "error")
+        with _runs_lock:
+            run["status"] = "error"; run["exit_code"] = 1
+        return
+
+    name = (req.suppl_name or url.rsplit("/", 1)[-1] or "download").split("?")[0]
+    dest = outdir / name
+    append(f"Downloading {name} → {dest}…", "step")
+    try:
+        with _u.urlopen(url, timeout=120) as resp:
+            total = int(resp.headers.get("Content-Length") or 0)
+            got, last_pct = 0, -1
+            with dest.open("wb") as fh:
+                while True:
+                    if cancelled():
+                        append("Run cancelled.", "error")
+                        dest.unlink(missing_ok=True)
+                        with _runs_lock:
+                            run["exit_code"] = 1
+                        return
+                    chunk = resp.read(262_144)
+                    if not chunk:
+                        break
+                    fh.write(chunk)
+                    got += len(chunk)
+                    if total:
+                        pct = int(got * 100 / total)
+                        if pct >= last_pct + 10:
+                            last_pct = pct
+                            append(f"  {pct}%  ({got:,} / {total:,} bytes)")
+        append(f"✓ Downloaded {got:,} bytes.", "ok")
+    except Exception as e:                       # noqa: BLE001 — surface, don't crash the run
+        append(f"✗ Download failed: {e}", "error")
+        dest.unlink(missing_ok=True)
+        with _runs_lock:
+            run["status"] = "error"; run["exit_code"] = 1
+        return
+
+    final = dest
+    if dest.suffix == ".gz":
+        unzipped = dest.with_suffix("")          # drop the .gz extension
+        append(f"Decompressing → {unzipped.name}…")
+        try:
+            with _gzip.open(dest, "rb") as gz, unzipped.open("wb") as out:
+                shutil.copyfileobj(gz, out)
+            dest.unlink(missing_ok=True)
+            final = unzipped
+            append("✓ Decompressed.", "ok")
+        except Exception as e:                   # noqa: BLE001
+            append(f"✗ Could not decompress (keeping the .gz): {e}", "error")
+            final = dest
+
+    append(f"✓ Saved → {final.resolve()}", "success")
+    append("This is a data matrix — pair it with a metadata CSV and run, e.g.:", "out")
+    append(f"  upstream proteomics  --intensities {final} --metadata meta.csv --outdir results/", "cmd")
+    append(f"  upstream methylation --method array --betas {final} --metadata meta.csv --outdir results/", "cmd")
     with _runs_lock:
         run["status"] = "done"; run["exit_code"] = 0
 
@@ -479,6 +624,16 @@ def geo_char(gse: str) -> dict:
     """Return sample characteristics from the GEO series matrix file."""
     from . import geo
     return geo.fetch_characteristics(gse)
+
+
+@app.get("/api/geo/suppl/{gse}")
+def geo_suppl(gse: str) -> dict:
+    """List a GEO series' supplementary files (intensity/beta matrices)."""
+    from . import geo
+    try:
+        return geo.fetch_supplementary_files(gse)
+    except ValueError as e:
+        raise HTTPException(404, str(e))
 
 
 @app.get("/api/browse")
@@ -543,9 +698,16 @@ _HTML = """<!DOCTYPE html>
   --bg:#1a1b26;--bg2:#24283b;--bg3:#1f2335;
   --border:#414868;--text:#a9b1d6;--bright:#c0caf5;
   --accent:#7aa2f7;--green:#9ece6a;--red:#f7768e;
-  --yellow:#e0af68;--cyan:#7dcfff;--dim:#565f89;
+  --yellow:#e0af68;--cyan:#7dcfff;--dim:#8a93bd;
 }
 *{box-sizing:border-box;margin:0;padding:0}
+/* visible focus ring for keyboard users (mouse focus stays subtle) */
+:focus-visible{outline:2px solid var(--accent);outline-offset:2px;border-radius:3px}
+/* respect users who prefer reduced motion */
+@media (prefers-reduced-motion:reduce){
+  *{transition:none!important}
+  .spin{animation:none!important}
+}
 body{background:var(--bg);color:var(--text);font-family:system-ui,sans-serif;
      height:100vh;display:flex;overflow:hidden}
 /* sidebar */
@@ -557,6 +719,8 @@ body{background:var(--bg);color:var(--text);font-family:system-ui,sans-serif;
             border-bottom:1px solid var(--border)}
 .sidebar h2{font-size:.65rem;text-transform:uppercase;letter-spacing:.1em;
             color:var(--dim);margin-bottom:.3rem}
+.track-domain{margin:.3rem 0 .25rem}
+.track-domain:first-child{margin-top:0}
 .track-btn{background:none;border:1px solid transparent;border-radius:6px;
            color:var(--text);cursor:pointer;padding:.45rem .65rem;
            text-align:left;width:100%;transition:all .15s}
@@ -730,11 +894,12 @@ input:checked+.slider::before{transform:translateX(14px)}
 <body>
 
 <div class="sidebar">
-  <h1>&#9889; upstream</h1>
-  <div>
-    <h2>Track</h2>
-    <div id="track-list" style="display:flex;flex-direction:column;gap:.2rem;margin-top:.4rem"></div>
-  </div>
+  <h1><span aria-hidden="true">&#9889;</span> upstream</h1>
+  <nav aria-label="Pipeline track">
+    <h2 id="track-heading">Track</h2>
+    <div id="track-list" aria-labelledby="track-heading"
+         style="display:flex;flex-direction:column;gap:.2rem;margin-top:.4rem"></div>
+  </nav>
   <div class="sidebar-footer">
     Pipeline runs on the server.<br>
     Output streams here live.<br>
@@ -746,15 +911,15 @@ input:checked+.slider::before{transform:translateX(14px)}
 
 <!-- File browser modal -->
 <div class="browser-modal" id="browser-modal">
-  <div class="browser-box">
+  <div class="browser-box" role="dialog" aria-modal="true" aria-label="File browser">
     <div class="browser-header">
-      <span class="browser-path" id="browser-path"></span>
+      <span class="browser-path" id="browser-path" aria-label="Current folder"></span>
       <button class="btn ghost" onclick="closeBrowser()" style="padding:.3rem .65rem;font-size:.72rem">Cancel</button>
     </div>
     <div class="browser-bar" id="browser-bar">
       <button class="btn" onclick="selectBrowserDir()" style="padding:.3rem .75rem;font-size:.75rem">Select this folder</button>
     </div>
-    <div class="browser-list" id="browser-list"></div>
+    <div class="browser-list" id="browser-list" role="listbox" aria-label="Folder contents"></div>
   </div>
 </div>
 
@@ -770,9 +935,10 @@ input:checked+.slider::before{transform:translateX(14px)}
         <label>Samples CSV</label>
         <div class="field-row">
           <input id="inp-samples" type="text" placeholder="/data/upstream/shared/fastq/rnaseq/samples.csv">
-          <button class="browse-btn" onclick="openBrowser('inp-samples','file')">...</button>
+          <button class="browse-btn" aria-label="Browse for samples CSV file" onclick="openBrowser('inp-samples','file')">...</button>
           <button class="browse-btn" onclick="buildSamplesheet()"
-                  title="Generate samples.csv from a folder of FASTQ files">&#9881; from folder</button>
+                  title="Generate samples.csv from a folder of FASTQ files"
+                  aria-label="Generate samples.csv from a folder of FASTQ files">&#9881; from folder</button>
         </div>
         <div class="hint">Generate with: <code>upstream download --track &lt;track&gt; --outdir .</code></div>
       </div>
@@ -780,7 +946,7 @@ input:checked+.slider::before{transform:translateX(14px)}
         <label>Output directory</label>
         <div class="field-row">
           <input id="inp-outdir" type="text" placeholder="results/">
-          <button class="browse-btn" onclick="openBrowser('inp-outdir','dir')">...</button>
+          <button class="browse-btn" aria-label="Browse for output directory" onclick="openBrowser('inp-outdir','dir')">...</button>
         </div>
       </div>
       <div class="field">
@@ -791,7 +957,7 @@ input:checked+.slider::before{transform:translateX(14px)}
       <div class="field full">
         <div class="toggle-row">
           <label class="toggle">
-            <input type="checkbox" id="inp-explain" checked>
+            <input type="checkbox" id="inp-explain" aria-label="Show step explanations" checked>
             <span class="slider"></span>
           </label>
           <span style="font-size:.825rem">Show step explanations</span>
@@ -800,7 +966,7 @@ input:checked+.slider::before{transform:translateX(14px)}
       <div class="field full">
         <div class="toggle-row">
           <label class="toggle">
-            <input type="checkbox" id="inp-dryrun">
+            <input type="checkbox" id="inp-dryrun" aria-label="Dry run — print the commands, run nothing">
             <span class="slider"></span>
           </label>
           <span style="font-size:.825rem">Dry run — print the commands, run nothing</span>
@@ -810,6 +976,15 @@ input:checked+.slider::before{transform:translateX(14px)}
 
     <!-- GEO download panel (shown only for download track) -->
     <div id="geo-panel">
+      <div class="field full" style="max-width:560px">
+        <label>What to download</label>
+        <select id="inp-dl-mode" onchange="updateDownloadMode()">
+          <option value="fastq">Sequencing reads — FASTQ from SRA (genomics &middot; RNA-seq &middot; ATAC/ChIP &middot; WGBS)</option>
+          <option value="matrix">Data matrix — GEO supplementary / URL (proteomics &middot; methylation array)</option>
+        </select>
+      </div>
+
+      <div id="dl-fastq-section">
       <details class="info-note">
         <summary>Paired-end vs single-end reads</summary>
         <div class="info-note-body">
@@ -839,7 +1014,7 @@ input:checked+.slider::before{transform:translateX(14px)}
         </div>
         <button class="btn ghost" id="btn-fetch" onclick="fetchGSE()">Fetch metadata</button>
       </div>
-      <div id="geo-msg" style="color:var(--red)"></div>
+      <div id="geo-msg" aria-live="polite" style="color:var(--red)"></div>
 
       <div id="geo-results" style="display:none">
         <div id="geo-series-info"></div>
@@ -881,11 +1056,64 @@ input:checked+.slider::before{transform:translateX(14px)}
             <label>Output directory</label>
             <div class="field-row">
               <input id="inp-geo-outdir" type="text" value="data/">
-              <button class="browse-btn" onclick="openBrowser('inp-geo-outdir','dir')">...</button>
+              <button class="browse-btn" aria-label="Browse for output directory" onclick="openBrowser('inp-geo-outdir','dir')">...</button>
             </div>
           </div>
+          <div class="field" style="max-width:175px">
+            <label>Reads / sample</label>
+            <input id="inp-geo-reads" type="text" value="1000000">
+            <div class="hint"><code>all</code> = full coverage (use for genomics)</div>
+          </div>
           <button class="btn" onclick="startGeoDownload()">Download selected</button>
-          <span id="geo-dl-msg" style="font-size:.74rem;color:var(--red)"></span>
+          <span id="geo-dl-msg" role="alert" style="font-size:.74rem;color:var(--red)"></span>
+        </div>
+      </div>
+      </div><!-- /dl-fastq-section -->
+
+      <div id="dl-matrix-section" style="display:none">
+        <details class="info-note">
+          <summary>Downloading a data matrix (proteomics / methylation array)</summary>
+          <div class="info-note-body">
+            <p>Proteomics and microarray (450K/EPIC) data are not sequencing reads in
+            SRA &mdash; they are deposited as <strong>supplementary files</strong> on GEO
+            (a protein intensity matrix, or a beta-value matrix). Enter a GEO series to
+            list and download one, or paste a direct URL (e.g. from PRIDE / ProteomeXchange
+            or a journal). A <code>.gz</code> file is decompressed for you.</p>
+          </div>
+        </details>
+        <div class="geo-fetch-row">
+          <div class="field">
+            <label>GEO Series Accession</label>
+            <input id="inp-suppl-gse" type="text" placeholder="GSE59685"
+                   style="text-transform:uppercase"
+                   onkeydown="if(event.key==='Enter')listSuppl()">
+          </div>
+          <button class="btn ghost" id="btn-suppl" onclick="listSuppl()">List files</button>
+        </div>
+        <div id="suppl-msg" aria-live="polite" style="color:var(--red)"></div>
+        <div id="suppl-list" style="display:none">
+          <div class="geo-table-wrap">
+            <table class="geo-table">
+              <thead><tr><th>Supplementary file</th><th></th></tr></thead>
+              <tbody id="suppl-tbody"></tbody>
+            </table>
+          </div>
+        </div>
+        <div class="field" style="max-width:560px;margin-top:.7rem">
+          <label>Or paste a direct file URL</label>
+          <input id="inp-suppl-url" type="text"
+                 placeholder="https://… supplementary matrix (PRIDE / journal)">
+        </div>
+        <div class="geo-dl-row">
+          <div class="field" style="max-width:280px">
+            <label>Output directory</label>
+            <div class="field-row">
+              <input id="inp-suppl-outdir" type="text" value="data/">
+              <button class="browse-btn" aria-label="Browse for output directory" onclick="openBrowser('inp-suppl-outdir','dir')">...</button>
+            </div>
+          </div>
+          <button class="btn" onclick="downloadSupplUrl()">Download from URL</button>
+          <span id="suppl-dl-msg" role="alert" style="font-size:.74rem;color:var(--red)"></span>
         </div>
       </div>
     </div>
@@ -893,7 +1121,7 @@ input:checked+.slider::before{transform:translateX(14px)}
     <!-- Run Pipeline button (hidden for download track) -->
     <div class="actions" id="run-actions" style="display:none">
       <button class="btn" onclick="startRun()">Run Pipeline</button>
-      <span id="form-msg" style="font-size:.74rem;color:var(--red)"></span>
+      <span id="form-msg" role="alert" style="font-size:.74rem;color:var(--red)"></span>
     </div>
   </div>
 
@@ -912,58 +1140,93 @@ input:checked+.slider::before{transform:translateX(14px)}
         <button class="btn danger" id="btn-stop" onclick="stopRun()">Stop</button>
       </div>
     </div>
-    <div class="log" id="log"></div>
-    <div class="status-bar" id="log-status"><span class="spin">&#8635;</span>&nbsp;Running&hellip;</div>
+    <div class="log" id="log" role="log" aria-live="polite" aria-label="Pipeline output"></div>
+    <div class="status-bar" id="log-status" role="status" aria-live="polite"><span class="spin" aria-hidden="true">&#8635;</span>&nbsp;Running&hellip;</div>
   </div>
 
 </div>
 
 <script>
 const TRACKS = {
-  rnaseq:      {label:"RNA-seq",      desc:"fastp → STAR or Salmon → counts matrix (OBAMA / DESeq2)", nsteps:3, isRnaseq:true},
-  atacseq:     {label:"ATAC-seq",     desc:"fastp → Bowtie2 → filter → MACS2 → matrix (OBAMA / DESeq2)", nsteps:5, extra:["bowtie2-index"]},
-  chipseq:     {label:"ChIP-seq",     desc:"fastp → Bowtie2 → filter → MACS2 (±input) → counts (DESeq2/edgeR)", nsteps:5, extra:["bowtie2-index"]},
-  methylation: {label:"Methylation",  desc:"WGBS (Bismark) or 450K/EPIC array (GEO beta matrix)",nsteps:4, isMethylation:true},
-  qc:          {label:"QC",           desc:"FastQC + MultiQC",                                    nsteps:2, extra:[]},
-  download:    {label:"Download Data",desc:"Browse GEO, pick conditions, fasterq-dump",          isDownload:true},
+  qc:          {label:"QC",           group:"Quality control", desc:"FastQC + MultiQC", nsteps:2, extra:[]},
+  genomics:    {label:"Genomics",     group:"Genomics",
+                desc:"fastp → BWA-MEM → markdup → bcftools → VCF + summary", nsteps:5,
+                isGenomics:true, extra:["reference"]},
+  rnaseq:      {label:"RNA-seq",      group:"Transcriptomics",
+                desc:"fastp → STAR or Salmon → counts matrix (OBAMA / DESeq2)", nsteps:3, isRnaseq:true},
+  atacseq:     {label:"ATAC-seq",     group:"Epigenomics",
+                desc:"fastp → Bowtie2 → filter → MACS2 → matrix (OBAMA / DESeq2)", nsteps:5, extra:["bowtie2-index"]},
+  chipseq:     {label:"ChIP-seq",     group:"Epigenomics",
+                desc:"fastp → Bowtie2 → filter → MACS2 (±input) → counts (DESeq2/edgeR)", nsteps:5, extra:["bowtie2-index"]},
+  methylation: {label:"Methylation",  group:"Epigenomics",
+                desc:"WGBS (Bismark) or 450K/EPIC array (GEO beta matrix)", nsteps:4, isMethylation:true},
+  proteomics:  {label:"Proteomics",   group:"Proteomics",
+                desc:"intensity matrix → filter → log2 → normalize → limma matrix", nsteps:1, isProteomics:true},
+  download:    {label:"Download Data",group:"Utilities", desc:"Browse GEO, pick conditions, fasterq-dump", isDownload:true},
 };
+
+// Sidebar grouping order (domains with no visible track are skipped).
+const DOMAINS = ["Quality control", "Genomics", "Transcriptomics", "Epigenomics", "Proteomics", "Utilities"];
 
 const EXTRA_INFO = {
   "star-index":    {label:"STAR index directory",     ph:"/data/upstream/shared/indices/star_hg38"},
   "salmon-index":  {label:"Salmon index directory",   ph:"/data/upstream/shared/indices/salmon_hg38"},
   "bowtie2-index": {label:"Bowtie2 index prefix",     ph:"/data/upstream/shared/indices/bowtie2_hg38/hg38"},
   "bismark-genome":{label:"Bismark genome directory", ph:"/data/upstream/shared/indices/bismark_hg38"},
+  "reference":     {label:"Reference genome FASTA",   ph:"/data/upstream/shared/indices/bwa_hg38/hg38.fa", btype:"file"},
 };
 
 let track = null, runId = null, sse = null, stepIdx = 0, _runNsteps = 0;
 
-// Build sidebar
+// Build sidebar — grouped by domain (each domain gets a visible <h2> heading inside
+// #track-list; the nav's accessible name stays "Track" via aria-labelledby).
 (function() {
   const tl = document.getElementById("track-list");
-  for (const [id, t] of Object.entries(TRACKS)) {
-    const b = document.createElement("button");
-    b.className = "track-btn"; b.id = "tb-"+id;
-    b.innerHTML = '<div class="tn">'+t.label+'</div><div class="td">'+t.desc+'</div>';
-    b.onclick = () => selectTrack(id);
-    tl.appendChild(b);
+  for (const dom of DOMAINS) {
+    const entries = Object.entries(TRACKS).filter(function(e){ return e[1].group === dom; });
+    if (!entries.length) continue;
+    const h = document.createElement("h2");
+    h.className = "track-domain"; h.textContent = dom;
+    tl.appendChild(h);
+    for (const [id, t] of entries) {
+      const b = document.createElement("button");
+      b.className = "track-btn"; b.id = "tb-"+id;
+      b.setAttribute("aria-pressed", "false");
+      b.innerHTML = '<div class="tn">'+t.label+'</div><div class="td">'+t.desc+'</div>';
+      b.onclick = () => selectTrack(id);
+      tl.appendChild(b);
+    }
   }
 })();
 
 function selectTrack(id) {
   if (runId) return;
   track = id;
-  document.querySelectorAll(".track-btn").forEach(b => b.classList.remove("active"));
-  document.getElementById("tb-"+id).classList.add("active");
+  document.querySelectorAll(".track-btn").forEach(b => {
+    b.classList.remove("active"); b.setAttribute("aria-pressed", "false");
+  });
+  const activeBtn = document.getElementById("tb-"+id);
+  activeBtn.classList.add("active"); activeBtn.setAttribute("aria-pressed", "true");
   document.getElementById("form-title").textContent = TRACKS[id].label;
   const fm = document.getElementById("form-msg"); if (fm) fm.textContent = "";
 
   const isDownload     = !!TRACKS[id].isDownload;
   const isRnaseq       = !!TRACKS[id].isRnaseq;
   const isMethylation  = !!TRACKS[id].isMethylation;
+  const isGenomics     = !!TRACKS[id].isGenomics;
+  const isProteomics   = !!TRACKS[id].isProteomics;
 
   document.getElementById("standard-grid").style.display = isDownload ? "none" : "";
   document.getElementById("run-actions").style.display   = isDownload ? "none" : "";
   document.getElementById("geo-panel").style.display     = isDownload ? "block" : "none";
+  if (isDownload && typeof updateDownloadMode === "function") updateDownloadMode();
+
+  // Reset the standard "Samples CSV" row: proteomics (and methylation-array, set later)
+  // don't use a samplesheet. Resetting here also re-shows it when switching back from
+  // a matrix-input track to a FASTQ track.
+  const _samplesRow = (document.getElementById("inp-samples") || {}).closest
+    ? document.getElementById("inp-samples").closest(".field") : null;
+  if (_samplesRow) _samplesRow.style.display = isProteomics ? "none" : "";
 
   if (!isDownload) {
     const ef = document.getElementById("extra-fields");
@@ -1007,13 +1270,59 @@ function selectTrack(id) {
         '</div>' +
         '<div id="meth-extra-fields" style="display:contents"></div>';
       updateMethylationMethod();
+    } else if (isProteomics) {
+      ef.innerHTML =
+        '<div class="field full">' +
+          '<label>Input type</label>' +
+          '<select id="inp-input-type">' +
+            '<option value="maxquant">MaxQuant proteinGroups.txt</option>' +
+            '<option value="matrix">Generic protein × sample matrix (CSV/TSV)</option>' +
+          '</select>' +
+        '</div>' +
+        '<div class="field full">' +
+          '<label>Intensity table</label>' +
+          '<div class="field-row">' +
+            '<input type="text" id="inp-intensities" placeholder="/data/proteinGroups.txt">' +
+            '<button class="browse-btn" data-inp="inp-intensities" data-btype="file">...</button>' +
+          '</div>' +
+        '</div>' +
+        '<div class="field full">' +
+          '<label>Metadata CSV (sample, group columns)</label>' +
+          '<div class="field-row">' +
+            '<input type="text" id="inp-metadata-csv" placeholder="/data/metadata.csv">' +
+            '<button class="browse-btn" data-inp="inp-metadata-csv" data-btype="file">...</button>' +
+          '</div>' +
+        '</div>' +
+        '<div class="field">' +
+          '<label>MaxQuant intensity column</label>' +
+          '<select id="inp-intensity-col">' +
+            '<option value="LFQ">LFQ — label-free (recommended)</option>' +
+            '<option value="iBAQ">iBAQ</option>' +
+            '<option value="Intensity">Intensity (raw)</option>' +
+          '</select>' +
+        '</div>' +
+        '<div class="field">' +
+          '<label>Normalization</label>' +
+          '<select id="inp-normalize">' +
+            '<option value="median">Median centering (recommended)</option>' +
+            '<option value="quantile">Quantile</option>' +
+            '<option value="none">None</option>' +
+          '</select>' +
+        '</div>' +
+        '<div class="field">' +
+          '<label>Min valid fraction / group</label>' +
+          '<input type="number" id="inp-min-valid" value="0.5" min="0" max="1" step="0.1">' +
+        '</div>' +
+        '<div class="hint">Starts from a MaxQuant proteinGroups.txt (or generic matrix). ' +
+          'The raw spectra → matrix step (MaxQuant/FragPipe) runs upstream.</div>';
+      _wireBrowse(ef);
     } else {
       ef.innerHTML = (TRACKS[id].extra || []).map(function(k) {
         const i = EXTRA_INFO[k];
         return '<div class="field full"><label>'+i.label+'</label>' +
                '<div class="field-row">' +
                '<input type="text" id="inp-'+k+'" placeholder="'+i.ph+'">' +
-               '<button class="browse-btn" data-inp="inp-'+k+'" data-btype="dir">...</button>' +
+               '<button class="browse-btn" data-inp="inp-'+k+'" data-btype="'+(i.btype||"dir")+'">...</button>' +
                '</div></div>';
       }).join("");
       if (id === "atacseq") {
@@ -1056,6 +1365,10 @@ function selectTrack(id) {
 function _wireBrowse(el) {
   el.querySelectorAll(".browse-btn[data-inp]").forEach(function(btn) {
     btn.onclick = function() { openBrowser(btn.dataset.inp, btn.dataset.btype || "any"); };
+    if (!btn.getAttribute("aria-label")) {
+      btn.setAttribute("aria-label",
+        btn.dataset.btype === "dir" ? "Browse for folder" : "Browse for file");
+    }
   });
 }
 
@@ -1195,7 +1508,15 @@ function _buildGeoHeader() {
     var th = document.createElement("th");
     if (col.key !== "_group" && col.key !== "_srr") {
       th.className = "geo-sort";
-      (function(k){ th.onclick = function(){ geoSortBy(k); }; })(col.key);
+      th.tabIndex = 0;
+      th.setAttribute("role", "button");
+      th.setAttribute("aria-label", "Sort by " + col.label);
+      (function(k){
+        th.onclick = function(){ geoSortBy(k); };
+        th.onkeydown = function(e){
+          if (e.key === "Enter" || e.key === " ") { e.preventDefault(); geoSortBy(k); }
+        };
+      })(col.key);
       var ind = (_geoSortCol === col.key)
         ? '<span class="sort-ind">'+(_geoSortAsc ? "&#9650;" : "&#9660;")+"</span>"
         : '<span class="sort-ind" style="opacity:0">&#9650;</span>';
@@ -1344,7 +1665,7 @@ function renderGeoTable() {
     var tdS = document.createElement("td");
     tdS.id = "srr-"+row.gsm;
     if (row.srr === null) {
-      tdS.innerHTML = '<span class="spin" style="font-size:.8rem">&#8635;</span>';
+      tdS.innerHTML = '<span class="spin" style="font-size:.8rem" aria-hidden="true">&#8635;</span>';
     } else if (!row.srr) {
       tdS.textContent = "not found"; tdS.className = "srr-err";
     } else {
@@ -1388,7 +1709,7 @@ function renderSummaryTable() {
     tr.appendChild(td3);
     var td4 = document.createElement("td");
     if (row.srr === null) {
-      td4.innerHTML = '<span class="spin" style="font-size:.8rem">&#8635;</span>';
+      td4.innerHTML = '<span class="spin" style="font-size:.8rem" aria-hidden="true">&#8635;</span>';
     } else {
       td4.textContent = row.srr || "not found";
       if (!row.srr) td4.className = "srr-err";
@@ -1579,11 +1900,82 @@ async function startGeoDownload() {
       "Assign at least one disease and one control sample.";
     return;
   }
+  // Reads: "all" → full coverage (-1); a number → subsample size; blank/0 → server default.
+  var rawReads = (document.getElementById("inp-geo-reads") || {value:""}).value.trim().toLowerCase();
+  var reads = null;
+  if (rawReads === "all" || rawReads === "full") reads = -1;
+  else if (rawReads) { var n = parseInt(rawReads, 10); if (!isNaN(n)) reads = n; }
   await _kickoffRun(
-    {track:"download_geo", outdir:outdir, geo_samples:geoSamples},
+    {track:"download_geo", outdir:outdir, geo_samples:geoSamples, reads:reads},
     "Download Data",
     1   // samples download in parallel — one timed batch step
   );
+}
+
+// ── GEO supplementary-matrix download (proteomics / methylation array) ──────
+
+function updateDownloadMode() {
+  var mode = (document.getElementById("inp-dl-mode") || {value:"fastq"}).value;
+  var fastq = document.getElementById("dl-fastq-section");
+  var matrix = document.getElementById("dl-matrix-section");
+  if (fastq)  fastq.style.display  = mode === "matrix" ? "none" : "";
+  if (matrix) matrix.style.display = mode === "matrix" ? "" : "none";
+}
+
+async function listSuppl() {
+  var inp = document.getElementById("inp-suppl-gse");
+  var gse = inp.value.trim().toUpperCase(); inp.value = gse;
+  var msg = document.getElementById("suppl-msg");
+  var listDiv = document.getElementById("suppl-list");
+  msg.textContent = ""; msg.style.color = "var(--red)"; listDiv.style.display = "none";
+  if (!gse) { msg.textContent = "Enter a GSE accession."; return; }
+  var btn = document.getElementById("btn-suppl");
+  btn.disabled = true; btn.textContent = "Listing…";
+  try {
+    var res = await fetch("/api/geo/suppl/" + encodeURIComponent(gse));
+    var data = await res.json();
+    if (!res.ok) { msg.textContent = data.detail || "No supplementary files found."; return; }
+    var tb = document.getElementById("suppl-tbody");
+    tb.innerHTML = "";
+    data.files.forEach(function(f) {
+      var tr = document.createElement("tr");
+      var td1 = document.createElement("td");
+      td1.textContent = f.name;
+      td1.style.cssText = "font-family:monospace;font-size:.72rem";
+      var td2 = document.createElement("td");
+      var b = document.createElement("button");
+      b.className = "btn ghost"; b.textContent = "↓ Download";
+      b.style.cssText = "font-size:.72rem;padding:.2rem .6rem";
+      b.setAttribute("aria-label", "Download " + f.name);
+      (function(url, name){ b.onclick = function(){ downloadSuppl(url, name); }; })(f.url, f.name);
+      td2.appendChild(b);
+      tr.appendChild(td1); tr.appendChild(td2); tb.appendChild(tr);
+    });
+    listDiv.style.display = "";
+    msg.style.color = "var(--dim)";
+    msg.textContent = data.files.length + " file(s) — the matrix is usually the "
+      + "*_betas / *_intensities / counts file.";
+  } catch (e) {
+    msg.textContent = "Network error: " + e.message;
+  } finally {
+    btn.disabled = false; btn.textContent = "List files";
+  }
+}
+
+async function downloadSuppl(url, name) {
+  var outdir = (document.getElementById("inp-suppl-outdir") || {value:"data/"}).value.trim() || "data/";
+  await _kickoffRun(
+    {track:"download_suppl", outdir:outdir, suppl_url:url, suppl_name:name},
+    "Download matrix", 1
+  );
+}
+
+async function downloadSupplUrl() {
+  var url = (document.getElementById("inp-suppl-url") || {value:""}).value.trim();
+  var dmsg = document.getElementById("suppl-dl-msg");
+  dmsg.textContent = "";
+  if (!url) { dmsg.textContent = "Paste a file URL, or use the GEO list above."; return; }
+  await downloadSuppl(url, "");
 }
 
 // ── Pipeline run ──────────────────────────────────────────────────────────
@@ -1622,6 +2014,22 @@ async function startRun() {
       body.bismark_genome = bg;
       await _kickoffRun(body, TRACKS[track].label+" (WGBS)", 4);
     }
+    return;
+  }
+
+  if (TRACKS[track].isProteomics) {
+    const intensities = (document.getElementById("inp-intensities")  || {value:""}).value.trim();
+    const metaCsv     = (document.getElementById("inp-metadata-csv") || {value:""}).value.trim();
+    if (!intensities) { err("Intensity table path is required."); return; }
+    if (!metaCsv)     { err("Metadata CSV path is required."); return; }
+    body.intensities   = intensities;
+    body.metadata_csv  = metaCsv;
+    body.input_type    = (document.getElementById("inp-input-type")    || {value:"maxquant"}).value;
+    body.intensity_col = (document.getElementById("inp-intensity-col") || {value:"LFQ"}).value;
+    body.normalize     = (document.getElementById("inp-normalize")     || {value:"median"}).value;
+    const mv = (document.getElementById("inp-min-valid") || {value:""}).value.trim();
+    if (mv !== "") body.min_valid = parseFloat(mv);
+    await _kickoffRun(body, TRACKS[track].label, 1);
     return;
   }
 
@@ -1664,7 +2072,7 @@ async function startRun() {
 async function _kickoffRun(body, label, nsteps) {
   // Preflight: validate samplesheet, tools, and paths before starting (pipeline tracks;
   // the GEO download checks its own tools server-side). Surfaced in the setup form.
-  if (body.track !== "download_geo") {
+  if (body.track !== "download_geo" && body.track !== "download_suppl") {
     try {
       const cr = await (await fetch("/api/check", {
         method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify(body)
@@ -1681,7 +2089,7 @@ async function _kickoffRun(body, label, nsteps) {
   document.getElementById("log-panel").style.display = "flex";
   document.getElementById("log-title").textContent = label || "";
   document.getElementById("log").innerHTML = "";
-  document.getElementById("log-status").innerHTML = '<span class="spin">&#8635;</span>&nbsp;Running&hellip;';
+  document.getElementById("log-status").innerHTML = '<span class="spin" aria-hidden="true">&#8635;</span>&nbsp;Running&hellip;';
   document.getElementById("btn-stop").style.display = "";
   document.getElementById("btn-newrun").style.display = "none";
 
@@ -1758,15 +2166,32 @@ async function _kickoffRun(body, label, nsteps) {
 let _browserTarget = null;
 let _browserType   = "any";
 let _browserMode   = "path";   // "path" = fill an input; "sheet" = build samples.csv from a folder
+let _browserOpener = null;     // element to restore focus to when the modal closes
+
+// Make a non-button element behave like a button for keyboard users.
+function _activatable(el, fn) {
+  el.tabIndex = 0;
+  el.setAttribute("role", "option");
+  el.onclick = fn;
+  el.onkeydown = function(e) {
+    if (e.key === "Enter" || e.key === " ") { e.preventDefault(); fn(); }
+  };
+}
 
 async function openBrowser(inputId, type) {
   _browserTarget = inputId;
   _browserType   = type;
+  _browserOpener = document.activeElement;
   const el = document.getElementById(inputId);
   const start = el ? el.value.trim() : "";
   document.getElementById("browser-bar").style.display = type === "file" ? "none" : "";
-  document.getElementById("browser-modal").classList.add("open");
+  const modal = document.getElementById("browser-modal");
+  modal.classList.add("open");
   await navigateBrowser(start || "~");
+  // Move focus into the dialog (first folder/file row, else the Cancel button).
+  const target = modal.querySelector(".browser-row") ||
+                 modal.querySelector(".browser-header button");
+  if (target) target.focus();
 }
 
 function buildSamplesheet() {
@@ -1777,6 +2202,8 @@ function buildSamplesheet() {
 function closeBrowser() {
   document.getElementById("browser-modal").classList.remove("open");
   _browserMode = "path";
+  if (_browserOpener && _browserOpener.focus) _browserOpener.focus();
+  _browserOpener = null;
 }
 
 async function navigateBrowser(path) {
@@ -1792,8 +2219,9 @@ async function navigateBrowser(path) {
     if (data.parent) {
       const row = document.createElement("div");
       row.className = "browser-row";
-      row.innerHTML = '<span class="browser-icon">&#128193;</span><span style="color:var(--dim)">..</span>';
-      row.onclick = function() { navigateBrowser(data.parent); };
+      row.setAttribute("aria-label", "Parent folder");
+      row.innerHTML = '<span class="browser-icon" aria-hidden="true">&#128193;</span><span style="color:var(--dim)">..</span>';
+      _activatable(row, function() { navigateBrowser(data.parent); });
       list.appendChild(row);
     }
 
@@ -1802,11 +2230,11 @@ async function navigateBrowser(path) {
       const row = document.createElement("div");
       row.className = "browser-row";
       const icon = e.is_dir ? "&#128193;" : "&#128196;";
-      row.innerHTML = '<span class="browser-icon">'+icon+'</span><span>'+e.name+'</span>';
+      row.innerHTML = '<span class="browser-icon" aria-hidden="true">'+icon+'</span><span>'+e.name+'</span>';
       if (e.is_dir) {
-        row.onclick = function() { navigateBrowser(e.path); };
+        _activatable(row, function() { navigateBrowser(e.path); });
       } else {
-        row.onclick = function() { pickBrowserItem(e.path); };
+        _activatable(row, function() { pickBrowserItem(e.path); });
       }
       list.appendChild(row);
     }
@@ -1985,8 +2413,48 @@ function reportRunError() {
   reportBug(log ? log.textContent.slice(-2000) : "");
 }
 
+// Associate each field's <label> with its primary control so screen readers
+// announce the label and clicking the label focuses the input. Fields are
+// rebuilt per track, so re-run whenever the setup panel's DOM changes.
+function _assocLabels() {
+  document.querySelectorAll("#setup-panel .field").forEach(function(f) {
+    var lbl = f.querySelector("label");
+    if (!lbl || lbl.htmlFor || lbl.classList.contains("toggle")) return;
+    var ctrl = f.querySelector("input, select, textarea");
+    if (ctrl && ctrl.id) lbl.htmlFor = ctrl.id;
+  });
+}
+(function() {
+  var panel = document.getElementById("setup-panel");
+  if (panel && typeof MutationObserver !== "undefined") {
+    new MutationObserver(_assocLabels).observe(panel, {childList: true, subtree: true});
+  }
+})();
+
+// File-browser modal: Escape to close, click backdrop to close, trap Tab inside.
+(function() {
+  var modal = document.getElementById("browser-modal");
+  if (!modal) return;
+  modal.addEventListener("mousedown", function(e) {
+    if (e.target === modal) closeBrowser();   // click outside the box
+  });
+  modal.addEventListener("keydown", function(e) {
+    if (!modal.classList.contains("open")) return;
+    if (e.key === "Escape") { e.preventDefault(); closeBrowser(); return; }
+    if (e.key !== "Tab") return;
+    var f = Array.prototype.filter.call(
+      modal.querySelectorAll('button, input, [tabindex]:not([tabindex="-1"])'),
+      function(el) { return el.offsetParent !== null; });
+    if (!f.length) return;
+    var first = f[0], last = f[f.length - 1];
+    if (e.shiftKey && document.activeElement === first) { e.preventDefault(); last.focus(); }
+    else if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); first.focus(); }
+  });
+})();
+
 selectTrack("rnaseq");
 _restoreInputs();
+_assocLabels();
 </script>
 </body>
 </html>

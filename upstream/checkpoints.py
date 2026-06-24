@@ -4,6 +4,7 @@ Each function takes specific file/directory paths and returns (ok: bool, message
 Messages are shown to the user — make them specific and actionable on failure.
 """
 
+import gzip
 import json
 import re
 from pathlib import Path
@@ -155,6 +156,67 @@ def check_methylation_cx_report(report_path: Path) -> tuple[bool, str]:
     if n < 100:
         return False, f"CX report has only {n} lines — extraction may have failed."
     return True, f"Methylation extraction OK — cytosine report written ({n:,} positions)."
+
+
+# ── Genomics (germline variant calling) ──────────────────────────────────
+
+
+def check_bwa_bam(bam_path: Path) -> tuple[bool, str]:
+    if not bam_path.exists():
+        return False, f"BAM not found: {bam_path.name}"
+    if not bam_path.with_suffix(".bam.bai").exists() and not Path(str(bam_path) + ".bai").exists():
+        return False, f"BAM index (.bai) not found for {bam_path.name}. Run samtools index."
+    if bam_path.stat().st_size < 1024:
+        return False, f"{bam_path.name} appears empty."
+    return True, f"Alignment OK — {bam_path.name} written and indexed."
+
+
+def check_markdup_bam(bam_path: Path) -> tuple[bool, str]:
+    if not bam_path.exists():
+        return False, f"Duplicate-marked BAM not found: {bam_path.name}"
+    if not bam_path.with_suffix(".bam.bai").exists() and not Path(str(bam_path) + ".bai").exists():
+        return False, f"BAM index (.bai) not found for {bam_path.name}. Run samtools index."
+    if bam_path.stat().st_size < 1024:
+        return False, f"{bam_path.name} appears empty."
+    return True, f"Duplicates marked — {bam_path.name} written and indexed."
+
+
+def check_vcf(vcf_path: Path) -> tuple[bool, str]:
+    """Validate a (bgzipped) VCF: a #CHROM header is required; 0 variant records is a
+    soft pass (tiny/subsampled teaching data can legitimately call nothing). Only a
+    missing #CHROM header is a hard failure."""
+    if not vcf_path.exists():
+        return False, f"VCF not found: {vcf_path.name}"
+    opener = gzip.open if str(vcf_path).endswith(".gz") else open
+    has_header = False
+    n = 0
+    try:
+        with opener(vcf_path, "rt") as f:
+            for line in f:
+                if line.startswith("#CHROM"):
+                    has_header = True
+                elif line.strip() and not line.startswith("#"):
+                    n += 1
+    except (OSError, EOFError) as e:
+        return False, f"Could not read VCF {vcf_path.name}: {e}"
+    if not has_header:
+        return False, f"Malformed VCF: no #CHROM header in {vcf_path.name}."
+    if n == 0:
+        return True, (f"VCF written but contains no variant records ({vcf_path.name}) — "
+                      "check coverage, or that the reference matches the sample organism.")
+    return True, f"VCF OK — {n:,} variant record(s)."
+
+
+def check_variant_summary(csv_path: Path) -> tuple[bool, str]:
+    if not csv_path.exists():
+        return False, f"Variant summary not found: {csv_path.name}"
+    lines = [l for l in csv_path.read_text().splitlines() if l.strip()]
+    expected = "sample,group,total_records,snps,indels,ts_tv"
+    if not lines or lines[0].strip() != expected:
+        return False, f"Variant summary header must be '{expected}'."
+    if len(lines) < 2:
+        return False, "Variant summary has no data rows."
+    return True, f"Variant summary OK — {len(lines) - 1} sample(s)."
 
 
 # ── OBAMA format ─────────────────────────────────────────────────────────

@@ -1,11 +1,13 @@
 """htsprep — HTS preprocessing pipeline
 
 Usage:
-  htsprep qc         --samples samples.csv --outdir results/
-  htsprep rnaseq     --samples samples.csv --star-index /ref/star --salmon-index /ref/salmon --outdir results/
-  htsprep atacseq    --samples samples.csv --bowtie2-index /ref/bt2/hg38 --outdir results/
-  htsprep chipseq    --samples samples.csv --bowtie2-index /ref/bt2/hg38 --peak-type narrow --outdir results/
+  htsprep qc          --samples samples.csv --outdir results/
+  htsprep genomics    --samples samples.csv --reference /ref/hg38.fa --outdir results/
+  htsprep rnaseq      --samples samples.csv --star-index /ref/star --salmon-index /ref/salmon --outdir results/
+  htsprep atacseq     --samples samples.csv --bowtie2-index /ref/bt2/hg38 --outdir results/
+  htsprep chipseq     --samples samples.csv --bowtie2-index /ref/bt2/hg38 --peak-type narrow --outdir results/
   htsprep methylation --samples samples.csv --bismark-genome /ref/bismark --outdir results/
+  htsprep proteomics  --intensities proteinGroups.txt --metadata metadata.csv --outdir results/
 
 Explanations are shown by default. Use --no-explain to suppress them.
 
@@ -28,7 +30,10 @@ from rich.console import Console
 from rich.markdown import Markdown
 from rich.panel import Panel
 
-from . import __version__, checkpoints, diagnostics, downloader, indexhelp, obama, preflight, runner
+from . import (
+    __version__, checkpoints, diagnostics, downloader, indexhelp, obama,
+    preflight, runner, variants,
+)
 from .samplesheet import scan_fastq_dir
 
 app = typer.Typer(
@@ -201,6 +206,30 @@ def _require_index(path: Optional[Path], tool: str, label: str) -> None:
         raise typer.Exit(1)
 
 
+def _require_bwa_index(reference: Optional[Path]) -> None:
+    """Require a reference FASTA with its bwa (.bwt) and samtools faidx (.fai) sidecars.
+
+    A bare FASTA without these would pass an existence check then fail mid-run, so we
+    validate the companions up front and point at index-help.
+    """
+    hint = ("[dim]Build it:[/dim] "
+            "[bold]upstream index-help --tool bwa --genome <human|mouse>[/bold]")
+    if reference is None or not Path(reference).is_file():
+        console.print(f"[bold red]Error:[/bold red] reference FASTA not found: {reference}")
+        console.print(hint)
+        raise typer.Exit(1)
+    ref = Path(reference)
+    if not Path(str(ref) + ".bwt").exists():
+        console.print(f"[bold red]Error:[/bold red] bwa index missing for {ref.name} "
+                      f"(expected {ref.name}.bwt).")
+        console.print(hint)
+        raise typer.Exit(1)
+    if not Path(str(ref) + ".fai").exists():
+        console.print(f"[bold red]Error:[/bold red] FASTA index missing for {ref.name} "
+                      f"(expected {ref.name}.fai). Run: [bold]samtools faidx {ref}[/bold]")
+        raise typer.Exit(1)
+
+
 def _check(ok: bool, msg: str) -> None:
     if runner.DRY_RUN:
         return  # nothing was produced to validate
@@ -215,6 +244,18 @@ def _next_steps(track: str, output_format: Optional[str]) -> list[str]:
     """Human-readable 'what to do next' lines for the run summary."""
     if track == "qc":
         return ["Open multiqc_report.html in a browser to review per-sample QC."]
+    if track == "genomics":
+        return [
+            "Review per-sample variants/<name>.vcf.gz and variant_summary.csv; "
+            "load cohort.vcf.gz (if merged) into IGV or a variant browser.",
+            "Production gold standard: GATK HaplotypeCaller (GVCF) + GenotypeGVCFs.",
+        ]
+    if track == "proteomics":
+        return [
+            "limma: load proteins_matrix.csv + coldata.csv "
+            "(see content/proteomics_export_formats.md). Values are normalized log2 "
+            "intensities; missing values (blank) are tolerated.",
+        ]
     steps: list[str] = []
     fmt = output_format or "obama"
     if fmt in ("obama", "both"):
@@ -291,7 +332,7 @@ def _explain(content_file: str) -> None:
 # ── QC ────────────────────────────────────────────────────────────────────
 
 
-@app.command()
+@app.command(rich_help_panel="Quality control")
 def qc(
     samples: SamplesOpt,
     outdir: OutdirOpt,
@@ -338,10 +379,179 @@ def qc(
     console.print(f"\n[bold green]QC complete.[/bold green] Open {multiqc_out}/multiqc_report.html")
 
 
+# ── Genomics ──────────────────────────────────────────────────────────────
+
+
+@app.command(rich_help_panel="Genomics")
+def genomics(
+    samples: SamplesOpt,
+    reference: Annotated[Path, typer.Option(
+        "--reference",
+        help="Reference genome FASTA. Its bwa index (.bwt/.amb/.ann/.pac/.sa) and "
+             ".fai must sit alongside it — see index-help --tool bwa.",
+    )],
+    outdir: OutdirOpt,
+    merge: Annotated[bool, typer.Option(
+        "--merge/--no-merge",
+        help="After per-sample calling, merge per-sample VCFs into cohort.vcf.gz "
+             "(bcftools merge). Auto-skipped with a single sample.",
+    )] = True,
+    min_mapq: Annotated[int, typer.Option(
+        "--min-mapq", help="Minimum read mapping quality for mpileup (-q).")] = 20,
+    min_baseq: Annotated[int, typer.Option(
+        "--min-baseq", help="Minimum base quality for mpileup (-Q).")] = 20,
+    threads: ThreadsOpt = 4,
+    explain: ExplainOpt = True,
+    dry_run: DryRunOpt = False,
+) -> None:
+    """Genomics: trim (fastp) → align (BWA-MEM) → mark duplicates → call variants (bcftools).
+
+    Germline short-variant calling. Each sample is aligned with BWA-MEM, duplicates
+    are marked, and SNVs/indels are called per sample with bcftools mpileup|call;
+    with --merge (default) the per-sample VCFs are combined into cohort.vcf.gz.
+    Output is VCF + variant_summary.csv — no matrix, no OBAMA. For production, use the
+    GATK Best Practices pipeline (HaplotypeCaller → GenotypeGVCFs).
+    """
+    sample_list = _read_samplesheet(samples)
+    _require_tools("genomics", dry=dry_run)
+    if not dry_run:
+        _require_bwa_index(reference)
+    runner.DRY_RUN = dry_run
+    outdir.mkdir(parents=True, exist_ok=True)
+
+    TOTAL = 5
+    console.print(f"\n[bold]Genomics pipeline[/bold] — {len(sample_list)} sample(s) → {outdir}\n")
+
+    results: list[tuple[str, str, Path, Path]] = []   # (name, group, vcf, stats)
+
+    for s in sample_list:
+        name, group = s["name"], s["group"]
+        paired = _is_paired(s)
+        sdir = outdir / name
+        sdir.mkdir(exist_ok=True)
+        layout = "paired-end" if paired else "single-end"
+        console.rule(f"[bold white]Sample: {name}  ({group})  [{layout}][/bold white]", style="white")
+
+        # 1 — Trim
+        runner.step_header("Trim — fastp", 1, TOTAL)
+        if explain:
+            _explain("genomics_trim.md")
+        trim_dir = sdir / "trimmed"
+        trim_dir.mkdir(exist_ok=True)
+        cmd, t_r1, t_r2 = _fastp_cmd(s, name, trim_dir, threads, ["--detect_adapter_for_pe"])
+        if runner.run(cmd) != 0:
+            _die(f"fastp failed for sample '{name}'.")
+        _check(*checkpoints.check_fastp_trim(trim_dir / f"{name}_fastp.json"))
+
+        # 2 — Align (BWA-MEM | samtools sort)
+        runner.step_header("Align — BWA-MEM", 2, TOTAL)
+        if explain:
+            _explain("genomics_align.md")
+        aln_dir = sdir / "aligned"
+        aln_dir.mkdir(exist_ok=True)
+        # bwa wants a literal '\t'-delimited @RG string; SM:<name> drives the VCF sample column.
+        rg = f"@RG\\tID:{name}\\tSM:{name}\\tPL:ILLUMINA\\tLB:{name}"
+        reads = [str(t_r1), str(t_r2)] if paired else [str(t_r1)]
+        bam_sorted = aln_dir / f"{name}.sorted.bam"
+        rc = runner.pipe(
+            ["bwa", "mem", "-t", str(threads), "-R", rg, str(reference), *reads],
+            ["samtools", "sort", "-@", str(threads), "-o", str(bam_sorted), "-"],
+        )
+        if rc != 0:
+            _die(f"bwa mem/samtools sort failed for sample '{name}'.")
+        runner.run(["samtools", "index", str(bam_sorted)])
+        _check(*checkpoints.check_bwa_bam(bam_sorted))
+
+        # 3 — Mark duplicates (germline FLAGS dups, does not remove them)
+        runner.step_header("Mark duplicates — samtools markdup", 3, TOTAL)
+        if explain:
+            _explain("genomics_markdup.md")
+        markdup_bam = aln_dir / f"{name}.markdup.bam"
+        if paired:
+            # markdup needs the ms tags from `fixmate -m`; chain collate→fixmate→sort→markdup.
+            collate_bam = aln_dir / f"{name}.collate.bam"
+            fixmate_bam = aln_dir / f"{name}.fixmate.bam"
+            possort_bam = aln_dir / f"{name}.possort.bam"
+            cmds = [
+                ["samtools", "collate", "-@", str(threads), "-o", str(collate_bam), str(bam_sorted)],
+                ["samtools", "fixmate", "-m", str(collate_bam), str(fixmate_bam)],
+                ["samtools", "sort", "-@", str(threads), "-o", str(possort_bam), str(fixmate_bam)],
+                ["samtools", "markdup", str(possort_bam), str(markdup_bam)],
+                ["samtools", "index", str(markdup_bam)],
+            ]
+        else:
+            # single-end: no mate, so markdup runs directly on the coord-sorted BAM.
+            cmds = [
+                ["samtools", "markdup", str(bam_sorted), str(markdup_bam)],
+                ["samtools", "index", str(markdup_bam)],
+            ]
+        for cmd in cmds:
+            if runner.run(cmd) != 0:
+                _die(f"markdup chain failed at: {' '.join(str(c) for c in cmd[:2])}")
+        _check(*checkpoints.check_markdup_bam(markdup_bam))
+
+        # 4 — Call variants (bcftools mpileup | call), bgzipped per sample
+        runner.step_header("Call variants — bcftools", 4, TOTAL)
+        if explain:
+            _explain("genomics_call.md")
+        var_dir = sdir / "variants"
+        var_dir.mkdir(exist_ok=True)
+        vcf = var_dir / f"{name}.vcf.gz"
+        rc = runner.pipe(
+            ["bcftools", "mpileup", "-f", str(reference),
+             "-q", str(min_mapq), "-Q", str(min_baseq),
+             "-a", "FORMAT/AD,FORMAT/DP", "-Ou", str(markdup_bam)],
+            ["bcftools", "call", "-mv", "-Oz", "-o", str(vcf)],
+        )
+        if rc != 0:
+            _die(f"bcftools mpileup/call failed for sample '{name}'.")
+        runner.run(["bcftools", "index", "-t", str(vcf)])  # tabix index (merge needs it)
+        _check(*checkpoints.check_vcf(vcf))
+        stats = var_dir / f"{name}.stats.txt"
+        runner.run_capture(["bcftools", "stats", str(vcf)], stats)
+        results.append((name, group, vcf, stats))
+
+    # 5 — Merge (optional) + combined summary
+    runner.step_header("Variant summary — bcftools stats", 5, TOTAL)
+    if explain:
+        _explain("genomics_summary.md")
+    if dry_run:
+        console.print(f"[yellow][dry-run][/yellow] would merge {len(results)} VCF(s) (if --merge) "
+                      f"and write variant_summary.csv → {outdir}")
+        console.print("\n[bold green]Dry run complete.[/bold green] No tools were executed.")
+        return
+
+    written: list[Path] = [v for _n, _g, v, _s in results]
+    if merge and len(results) >= 2:
+        cohort = outdir / "cohort.vcf.gz"
+        rc = runner.run(["bcftools", "merge", "-Oz", "-o", str(cohort),
+                         "--threads", str(threads), *[str(v) for _n, _g, v, _s in results]])
+        if rc != 0:
+            _die("bcftools merge failed.")
+        runner.run(["bcftools", "index", "-t", str(cohort)])
+        _check(*checkpoints.check_vcf(cohort))
+        runner.run_capture(["bcftools", "stats", str(cohort)], outdir / "cohort.stats.txt")
+        written.append(cohort)
+    elif merge:
+        console.print("  [dim]Single sample — skipping cohort merge (nothing to merge).[/dim]")
+
+    summary = outdir / "variant_summary.csv"
+    variants.write_variant_summary(results, summary)
+    _check(*checkpoints.check_variant_summary(summary))
+    written.append(summary)
+
+    mqc = _auto_multiqc(outdir)
+    if mqc:
+        written = list(written) + [mqc]
+    _write_run_summary(outdir, "genomics", written, None,
+                       {"samples": str(samples), "reference": str(reference), "merge": str(merge)})
+    console.print(f"\n[bold green]Done.[/bold green] Wrote: {', '.join(p.name for p in written)} → {outdir}")
+
+
 # ── RNA-seq ───────────────────────────────────────────────────────────────
 
 
-@app.command()
+@app.command(rich_help_panel="Transcriptomics")
 def rnaseq(
     samples: SamplesOpt,
     outdir: OutdirOpt,
@@ -538,7 +748,7 @@ def rnaseq(
 # ── ATAC-seq ──────────────────────────────────────────────────────────────
 
 
-@app.command()
+@app.command(rich_help_panel="Epigenomics")
 def atacseq(
     samples: SamplesOpt,
     bowtie2_index: Annotated[Path, typer.Option("--bowtie2-index", help="Bowtie2 index prefix (path/to/hg38)")],
@@ -683,7 +893,7 @@ def atacseq(
 # ── ChIP-seq ─────────────────────────────────────────────────────────────────
 
 
-@app.command()
+@app.command(rich_help_panel="Epigenomics")
 def chipseq(
     samples: SamplesOpt,
     bowtie2_index: Annotated[Path, typer.Option("--bowtie2-index", help="Bowtie2 index prefix (path/to/hg38)")],
@@ -851,7 +1061,7 @@ def chipseq(
 # ── Methylation ────────────────────────────────────────────────────────────
 
 
-@app.command()
+@app.command(rich_help_panel="Epigenomics")
 def methylation(
     outdir: OutdirOpt,
     method: Annotated[str, typer.Option("--method",
@@ -1053,10 +1263,90 @@ def methylation(
                   f"{', '.join(p.name for p in written)} → {outdir}")
 
 
+# ── Proteomics ───────────────────────────────────────────────────────────────
+
+
+@app.command(rich_help_panel="Proteomics")
+def proteomics(
+    intensities: Annotated[Path, typer.Option(
+        "--intensities",
+        help="MaxQuant proteinGroups.txt OR a generic protein x sample matrix (CSV/TSV).")],
+    metadata: Annotated[Path, typer.Option(
+        "--metadata",
+        help="Metadata CSV with columns 'sample' and 'group' (group = disease/control).")],
+    outdir: OutdirOpt,
+    input_type: Annotated[str, typer.Option(
+        "--input-type",
+        help="'maxquant' (proteinGroups.txt) or 'matrix' (generic protein x sample table).")] = "maxquant",
+    intensity_col: Annotated[str, typer.Option(
+        "--intensity-col",
+        help="MaxQuant quant column: 'LFQ' (default), 'iBAQ', or 'Intensity'.")] = "LFQ",
+    min_valid: Annotated[float, typer.Option(
+        "--min-valid",
+        help="Min fraction (0..1) of non-missing values required PER GROUP to keep a protein.")] = 0.5,
+    normalize: Annotated[str, typer.Option(
+        "--normalize",
+        help="Normalization: 'median' (default), 'quantile', or 'none'.")] = "median",
+    explain: ExplainOpt = True,
+    dry_run: DryRunOpt = False,
+) -> None:
+    """Proteomics: intensity matrix → filter → log2 → normalize → limma matrix + coldata.
+
+    Starts from a MaxQuant proteinGroups.txt (or a generic protein x sample matrix),
+    drops contaminant/reverse hits, filters proteins by a per-group valid-value
+    fraction, log2-transforms, normalizes, and writes proteins_matrix.csv + coldata.csv
+    for limma. Pure Python — no external tools, no OBAMA. The raw-spectra → matrix step
+    (MaxQuant/FragPipe) runs upstream and is out of scope.
+    """
+    if input_type not in ("maxquant", "matrix"):
+        _die("--input-type must be 'maxquant' or 'matrix'.")
+    if intensity_col not in ("LFQ", "iBAQ", "Intensity"):
+        _die("--intensity-col must be 'LFQ', 'iBAQ', or 'Intensity'.")
+    if normalize not in ("median", "quantile", "none"):
+        _die("--normalize must be 'median', 'quantile', or 'none'.")
+    if not intensities.exists():
+        _die(f"Intensity table not found: {intensities}")
+    if not metadata.exists():
+        _die(f"Metadata file not found: {metadata}")
+
+    runner.DRY_RUN = dry_run
+    outdir.mkdir(parents=True, exist_ok=True)
+
+    TOTAL = 1
+    console.print("\n[bold]Proteomics pipeline[/bold] — building matrices\n")
+    runner.step_header("Build protein expression matrix", 1, TOTAL)
+    if explain:
+        _explain("proteomics_quantify.md")
+        _explain("proteomics_export_formats.md")
+
+    if dry_run:
+        console.print(f"[yellow][dry-run][/yellow] would parse {input_type} intensities, drop "
+                      f"contaminant/reverse rows, valid-value filter (≥{min_valid}/group), log2, "
+                      f"normalize ('{normalize}') → proteins_matrix.csv + coldata.csv → {outdir} "
+                      "(no external tools).")
+        console.print("\n[bold green]Dry run complete.[/bold green]")
+        return
+
+    try:
+        written = obama.write_proteomics_outputs(
+            intensities, metadata, outdir,
+            input_type=input_type, intensity_col=intensity_col,
+            min_valid=min_valid, normalize=normalize,
+        )
+    except ValueError as e:
+        _die(str(e))
+    _check(*checkpoints.check_counts_matrix(outdir / "proteins_matrix.csv", outdir / "coldata.csv"))
+    _write_run_summary(outdir, "proteomics", written, None,
+                       {"intensities": str(intensities), "metadata": str(metadata),
+                        "input_type": input_type, "intensity_col": intensity_col,
+                        "min_valid": str(min_valid), "normalize": normalize})
+    console.print(f"\n[bold green]Done.[/bold green] Wrote: {', '.join(p.name for p in written)} → {outdir}")
+
+
 # ── Samplesheet generation ───────────────────────────────────────────────────
 
 
-@app.command()
+@app.command(rich_help_panel="Utilities")
 def samplesheet(
     directory: Annotated[Path, typer.Option("--dir", help="Folder of FASTQ files to scan.")],
     out: Annotated[Optional[Path], typer.Option(
@@ -1092,9 +1382,9 @@ def samplesheet(
 # ── Index help ───────────────────────────────────────────────────────────────
 
 
-@app.command(name="index-help")
+@app.command(name="index-help", rich_help_panel="Utilities")
 def index_help(
-    tool: Annotated[str, typer.Option("--tool", help="salmon | star | bowtie2 | bismark")],
+    tool: Annotated[str, typer.Option("--tool", help="salmon | star | bowtie2 | bismark | bwa")],
     genome: Annotated[str, typer.Option("--genome", help="human | mouse")] = "human",
 ) -> None:
     """Print recommended commands to obtain/build a reference index.
@@ -1117,7 +1407,7 @@ def index_help(
 # ── Bug report ───────────────────────────────────────────────────────────────
 
 
-@app.command()
+@app.command(rich_help_panel="Utilities")
 def bug(
     out: Annotated[Optional[Path], typer.Option(
         "--out", help="Also save the diagnostics to this file.")] = None,
@@ -1140,10 +1430,11 @@ def bug(
 # ── Check (preflight) ────────────────────────────────────────────────────────
 
 
-@app.command()
+@app.command(rich_help_panel="Utilities")
 def check(
     track: Annotated[str, typer.Option(
-        "--track", help="Track to validate: qc, rnaseq, atacseq, chipseq, methylation.")],
+        "--track", help="Track to validate: qc, genomics, rnaseq, atacseq, chipseq, "
+                        "methylation, proteomics.")],
     samples: Annotated[Optional[Path], typer.Option("--samples", help="Samplesheet to validate.")] = None,
     aligner: Annotated[str, typer.Option("--aligner", help="rnaseq aligner (salmon/star).")] = "salmon",
     method: Annotated[str, typer.Option("--method", help="methylation method (wgbs/array).")] = "wgbs",
@@ -1152,6 +1443,8 @@ def check(
     star_index: Annotated[Optional[Path], typer.Option("--star-index")] = None,
     bowtie2_index: Annotated[Optional[Path], typer.Option("--bowtie2-index")] = None,
     bismark_genome: Annotated[Optional[Path], typer.Option("--bismark-genome")] = None,
+    reference: Annotated[Optional[Path], typer.Option("--reference", help="genomics reference FASTA.")] = None,
+    intensities: Annotated[Optional[Path], typer.Option("--intensities", help="proteomics intensity table.")] = None,
     betas: Annotated[Optional[Path], typer.Option("--betas")] = None,
     metadata: Annotated[Optional[Path], typer.Option("--metadata")] = None,
 ) -> None:
@@ -1159,7 +1452,7 @@ def check(
 
     Reports every problem at once — bad samplesheet rows, missing FASTQ files,
     invalid group labels, unmatched ChIP controls, tools not on PATH, and missing
-    index/genome directories — so you can fix them before a long run starts.
+    index/genome/reference files — so you can fix them before a long run starts.
     """
     issues = preflight.run_issues(
         track,
@@ -1168,6 +1461,8 @@ def check(
         salmon_index=str(salmon_index) if salmon_index else None,
         star_index=str(star_index) if star_index else None,
         bismark_genome=str(bismark_genome) if bismark_genome else None,
+        reference=str(reference) if reference else None,
+        intensities=str(intensities) if intensities else None,
         betas=str(betas) if betas else None,
         metadata=str(metadata) if metadata else None,
     )
@@ -1183,7 +1478,7 @@ def check(
 # ── Download ───────────────────────────────────────────────────────────────
 
 
-@app.command()
+@app.command(rich_help_panel="Utilities")
 def download(
     track: Annotated[Optional[str], typer.Option(
         "--track",
@@ -1227,7 +1522,7 @@ def download(
 # ── Serve ─────────────────────────────────────────────────────────────────
 
 
-@app.command()
+@app.command(rich_help_panel="Utilities")
 def serve(
     port: Annotated[int, typer.Option("--port", help="Port to listen on.")] = 8421,
     host: Annotated[str, typer.Option("--host", help="Host to bind (127.0.0.1 = localhost only).")] = "127.0.0.1",
@@ -1256,3 +1551,7 @@ def serve(
             f"  [dim]ssh -L {port}:localhost:{port} your_username@server[/dim]\n"
         )
     uvicorn.run(web_app, host=host, port=port, log_level="warning")
+
+
+if __name__ == "__main__":   # enables `python -m upstream.cli` (server _upstream_argv fallback)
+    app()

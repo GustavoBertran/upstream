@@ -23,6 +23,10 @@ def required_tools(
         return ["fastqc", "multiqc"]
     if track == "rnaseq":
         return ["fastp", "STAR" if aligner == "star" else "salmon"]
+    if track == "genomics":
+        return ["fastp", "bwa", "samtools", "bcftools"]
+    if track == "proteomics":
+        return []  # pure-Python intensity-matrix analysis
     if track in ("atacseq", "chipseq"):
         tools = ["fastp", "bowtie2", "samtools", "macs2"]
         if output_format in ("matrix", "both"):
@@ -129,13 +133,15 @@ def run_issues(
     bismark_genome: Optional[str] = None,
     betas: Optional[str] = None,
     metadata: Optional[str] = None,
+    reference: Optional[str] = None,
+    intensities: Optional[str] = None,
 ) -> list[str]:
     """All problems that would block a run of *track* — the shared preflight used by
     both `upstream check` and the web UI's pre-run gate. Empty list = ready to run."""
     issues: list[str] = []
     allow_input = track == "chipseq"
     needs_samplesheet = (
-        track in ("qc", "rnaseq", "atacseq", "chipseq")
+        track in ("qc", "rnaseq", "atacseq", "chipseq", "genomics")
         or (track == "methylation" and method != "array")
     )
 
@@ -162,5 +168,23 @@ def run_issues(
 
     if track == "methylation" and method == "array":
         issues += validate_files({"betas": betas, "metadata": metadata})
+
+    if track == "genomics":
+        if reference:
+            ref = Path(reference)
+            if not ref.is_file():
+                issues.append(f"reference FASTA not found: {reference}")
+            else:
+                if not Path(str(ref) + ".bwt").exists():
+                    issues.append(f"reference: bwa index missing ({ref.name}.bwt) — "
+                                  "see index-help --tool bwa")
+                if not Path(str(ref) + ".fai").exists():
+                    issues.append(f"reference: samtools faidx index missing ({ref.name}.fai) — "
+                                  f"run samtools faidx {ref}")
+        else:
+            issues.append("reference: not provided")
+
+    if track == "proteomics":
+        issues += validate_files({"intensities": intensities, "metadata": metadata})
 
     return issues

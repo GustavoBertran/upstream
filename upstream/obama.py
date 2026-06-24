@@ -16,12 +16,18 @@ Matrix format (for DESeq2 / edgeR / limma-voom) — two files, features as rows:
 
 RNA-seq values are RAW COUNTS (what OBAMA expects): Salmon NumReads (optionally
 aggregated transcript -> gene via a tx2gene map) and STAR ReadsPerGene counts.
+
+This file also hosts the non-OBAMA matrix builders that share its CSV/coldata
+utilities: the methylation-array import and the proteomics intensity-matrix
+analysis (write_proteomics_outputs) — both produce a feature x sample matrix +
+coldata for limma, never an OBAMA matrix.
 """
 
 import csv
 import gzip
 import math
 import re
+import statistics
 from pathlib import Path
 from typing import Optional
 
@@ -505,6 +511,271 @@ def write_methylation_array_outputs(
         written += [mpath, cpath]
 
     return written
+
+
+# ── Proteomics (intensity matrix → limma matrix; non-OBAMA) ──────────────────
+
+# MaxQuant proteinGroups quant-column prefixes, by --intensity-col choice.
+_PROT_QUANT_PREFIX = {"LFQ": "LFQ intensity ", "iBAQ": "iBAQ ", "Intensity": "Intensity "}
+# Rows flagged '+' in any present column below are dropped (decoys/contaminants).
+_PROT_FLAG_COLS = ("Potential contaminant", "Contaminant", "Reverse", "Only identified by site")
+_PROT_NA = {"", "NA", "NaN", "nan", "NAN", "#NUM!"}
+
+
+def _read_proteomics_metadata(path: Path) -> dict[str, str]:
+    """Read a proteomics metadata CSV → ordered {sample: group}.
+
+    Requires columns 'sample' and 'group'; group must be 'disease' or 'control'.
+    """
+    meta: dict[str, str] = {}
+    bad: list[str] = []
+    with Path(path).open() as f:
+        reader = csv.DictReader(f)
+        cols = set(reader.fieldnames or [])
+        if not {"sample", "group"} <= cols:
+            raise ValueError("metadata CSV must have 'sample' and 'group' columns.")
+        for row in reader:
+            sample = (row.get("sample") or "").strip()
+            group = (row.get("group") or "").strip()
+            if not sample:
+                continue
+            if group not in ("disease", "control"):
+                bad.append(f"{sample}={group or '(empty)'}")
+            meta[sample] = group
+    if bad:
+        raise ValueError("group must be 'disease' or 'control'. Invalid: " + ", ".join(bad))
+    if not meta:
+        raise ValueError("metadata CSV has no sample rows.")
+    return meta
+
+
+def _to_intensity(raw: str) -> Optional[float]:
+    """Parse one intensity cell: blank/NA/0 → None (0 = not detected in MaxQuant)."""
+    raw = (raw or "").strip()
+    if raw in _PROT_NA:
+        return None
+    try:
+        v = float(raw)
+    except ValueError:
+        return None
+    return v if v > 0 else None
+
+
+def _read_maxquant_proteingroups(
+    path: Path, intensity_col: str,
+) -> tuple[list[str], list[str], dict[str, list[Optional[float]]]]:
+    """Parse a MaxQuant proteinGroups.txt → (protein_ids, sample_names, {pid: [vals]}).
+
+    Drops contaminant / reverse / 'only identified by site' rows (any present flag
+    column == '+'). Protein id = first accession of 'Majority protein IDs'
+    (fallback 'Protein IDs'). Quant columns are detected by the prefix for the
+    chosen intensity_col; the sample name is the text after the prefix. Spurious
+    matches (e.g. 'iBAQ peptides') are harmless — they are dropped later when the
+    sample set is intersected with the metadata.
+    """
+    prefix = _PROT_QUANT_PREFIX[intensity_col]
+    with Path(path).open() as f:
+        reader = csv.reader(f, delimiter="\t")
+        header = next(reader, None)
+        if not header:
+            raise ValueError("proteinGroups.txt appears empty.")
+        idx = {name: i for i, name in enumerate(header)}
+        id_col = idx.get("Majority protein IDs", idx.get("Protein IDs"))
+        if id_col is None:
+            raise ValueError("proteinGroups.txt has no 'Majority protein IDs' / 'Protein IDs' column.")
+        flag_cols = [idx[c] for c in _PROT_FLAG_COLS if c in idx]
+        quant = [(i, h[len(prefix):].strip()) for i, h in enumerate(header)
+                 if h.startswith(prefix) and h[len(prefix):].strip()]
+        if not quant:
+            raise ValueError(
+                f"No '{prefix.strip()}' quant columns found in proteinGroups.txt. "
+                f"Check --intensity-col (looked for headers starting '{prefix}')."
+            )
+        sample_names = [s for _i, s in quant]
+
+        protein_ids: list[str] = []
+        data: dict[str, list[Optional[float]]] = {}
+        seen: set[str] = set()
+        for row in reader:
+            if len(row) <= id_col:
+                continue
+            if any(row[c].strip() == "+" for c in flag_cols if c < len(row)):
+                continue
+            pid = row[id_col].split(";")[0].strip()
+            if not pid or pid in seen:
+                continue
+            seen.add(pid)
+            protein_ids.append(pid)
+            data[pid] = [_to_intensity(row[i]) if i < len(row) else None for i, _s in quant]
+    return protein_ids, sample_names, data
+
+
+def _read_generic_matrix(
+    path: Path,
+) -> tuple[list[str], list[str], dict[str, list[Optional[float]]]]:
+    """Parse a generic protein x sample table (CSV or TSV, auto-detected)."""
+    text_lines = [l for l in Path(path).read_text().splitlines() if l.strip()]
+    if len(text_lines) < 2:
+        raise ValueError("intensity matrix needs a header and at least one protein row.")
+    sep = "\t" if "\t" in text_lines[0] else ","
+    header = [c.strip() for c in text_lines[0].split(sep)]
+    sample_names = header[1:]
+    if not sample_names:
+        raise ValueError("intensity matrix has no sample columns after the protein column.")
+    protein_ids: list[str] = []
+    data: dict[str, list[Optional[float]]] = {}
+    seen: set[str] = set()
+    for line in text_lines[1:]:
+        cells = [c.strip() for c in line.split(sep)]
+        pid = cells[0]
+        if not pid or pid in seen:
+            continue
+        seen.add(pid)
+        protein_ids.append(pid)
+        data[pid] = [_to_intensity(cells[i]) if i < len(cells) else None
+                     for i in range(1, len(sample_names) + 1)]
+    return protein_ids, sample_names, data
+
+
+def _proteomics_normalize_median(
+    logvals: dict[str, dict[str, Optional[float]]], proteins: list[str], samples: list[str],
+) -> dict[str, dict[str, Optional[float]]]:
+    """Median-center each sample to the global median of per-sample medians.
+
+    Aligns sample medians (corrects loading differences) while preserving scale —
+    after this every sample's median of observed values equals the common median.
+    """
+    sample_med: dict[str, float] = {}
+    for s in samples:
+        obs = [logvals[p][s] for p in proteins if logvals[p][s] is not None]
+        sample_med[s] = statistics.median(obs) if obs else 0.0
+    gmed = statistics.median(list(sample_med.values())) if sample_med else 0.0
+    return {
+        p: {s: (None if logvals[p][s] is None else logvals[p][s] - (sample_med[s] - gmed))
+            for s in samples}
+        for p in proteins
+    }
+
+
+def _proteomics_normalize_quantile(
+    logvals: dict[str, dict[str, Optional[float]]], proteins: list[str], samples: list[str],
+) -> dict[str, dict[str, Optional[float]]]:
+    """NA-aware rank-based quantile normalization.
+
+    Builds a reference distribution by interpolating each sample's sorted observed
+    values onto a common n-point grid and averaging across samples, then maps every
+    value back via its within-sample rank. With a complete (no-missing) matrix this
+    reduces to classic quantile normalization (all columns share one sorted vector).
+    """
+    n = len(proteins)
+    ref = [0.0] * n
+    contributing = [0] * n
+
+    def interp(sorted_obs: list[float], q: float) -> float:
+        m = len(sorted_obs)
+        if m == 1:
+            return sorted_obs[0]
+        idx = q * (m - 1)
+        lo = math.floor(idx)
+        hi = math.ceil(idx)
+        return sorted_obs[lo] * (1 - (idx - lo)) + sorted_obs[hi] * (idx - lo)
+
+    for s in samples:
+        obs = sorted(v for v in (logvals[p][s] for p in proteins) if v is not None)
+        if not obs:
+            continue
+        for k in range(n):
+            q = k / (n - 1) if n > 1 else 0.0
+            ref[k] += interp(obs, q)
+            contributing[k] += 1
+    ref = [ref[k] / contributing[k] if contributing[k] else 0.0 for k in range(n)]
+
+    out: dict[str, dict[str, Optional[float]]] = {p: {} for p in proteins}
+    for s in samples:
+        pairs = sorted((logvals[p][s], p) for p in proteins if logvals[p][s] is not None)
+        m = len(pairs)
+        for rank, (_v, p) in enumerate(pairs):
+            q = rank / (m - 1) if m > 1 else 0.0
+            out[p][s] = interp(ref, q)
+        for p in proteins:
+            if logvals[p][s] is None:
+                out[p][s] = None
+    return out
+
+
+def write_proteomics_outputs(
+    intensities_path: Path,
+    metadata_path: Path,
+    outdir: Path,
+    input_type: str = "maxquant",
+    intensity_col: str = "LFQ",
+    min_valid: float = 0.5,
+    normalize: str = "median",
+) -> list[Path]:
+    """Proteomics intensity matrix → proteins_matrix.csv + coldata.csv (for limma).
+
+    Real pure-Python analysis: drop contaminant/reverse hits (MaxQuant), keep only
+    samples present in the metadata, filter proteins by a per-group valid-value
+    fraction, log2-transform, normalize, and write a feature x sample matrix +
+    coldata. No imputation (residual missing stays blank; limma tolerates NA).
+    No OBAMA output.
+    """
+    meta = _read_proteomics_metadata(metadata_path)
+    if input_type == "maxquant":
+        prot_ids, file_samples, data = _read_maxquant_proteingroups(intensities_path, intensity_col)
+    else:
+        prot_ids, file_samples, data = _read_generic_matrix(intensities_path)
+
+    file_idx = {s: i for i, s in enumerate(file_samples)}
+    samples = [s for s in meta if s in file_idx]   # metadata order, intersected
+    if not samples:
+        raise ValueError(
+            "No samples in the intensity table matched the metadata 'sample' values. "
+            "Check that sample names match the quant-column suffixes."
+        )
+
+    vals = {pid: {s: data[pid][file_idx[s]] for s in samples} for pid in prot_ids}
+
+    groups: dict[str, list[str]] = {}
+    for s in samples:
+        groups.setdefault(meta[s], []).append(s)
+
+    kept: list[str] = []
+    for pid in prot_ids:
+        keep = True
+        for gsamples in groups.values():
+            present = sum(1 for s in gsamples if vals[pid][s] is not None)
+            if present < min_valid * len(gsamples) - 1e-9:
+                keep = False
+                break
+        if keep:
+            kept.append(pid)
+    if not kept:
+        raise ValueError(
+            "No proteins survived the valid-value filter. "
+            f"Lower --min-valid (currently {min_valid}) or check the input."
+        )
+
+    logvals = {
+        pid: {s: (math.log2(vals[pid][s]) if vals[pid][s] is not None else None) for s in samples}
+        for pid in kept
+    }
+    if normalize == "median":
+        logvals = _proteomics_normalize_median(logvals, kept, samples)
+    elif normalize == "quantile":
+        logvals = _proteomics_normalize_quantile(logvals, kept, samples)
+
+    matrix_path = Path(outdir) / "proteins_matrix.csv"
+    coldata_path = Path(outdir) / "coldata.csv"
+    with matrix_path.open("w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["protein"] + samples)
+        for pid in kept:
+            writer.writerow(
+                [pid] + ["" if logvals[pid][s] is None else round(logvals[pid][s], 4) for s in samples]
+            )
+    _write_coldata(coldata_path, [(s, meta[s]) for s in samples])
+    return [matrix_path, coldata_path]
 
 
 def build_atac_consensus(peak_files: list[Path], out_bed: Path) -> int:
