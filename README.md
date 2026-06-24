@@ -54,7 +54,15 @@ The interface lets you:
 - **Select a track** in the sidebar, grouped by domain (Genomics, Transcriptomics, Epigenomics,
   Proteomics, plus QC and Download Data)
 - **Stream output** live as the pipeline runs
-- **Download GEO data** — type a GSE accession, assign disease/control groups, and download FASTQ files with one click
+- **Download data** — the **Download Data** track has two modes:
+  - *Sequencing reads (FASTQ)* — type a GSE accession, assign disease/control groups, and
+    download FASTQ from SRA. This covers every sequencing track (**genomics**, RNA-seq,
+    ATAC/ChIP, WGBS). Set **Reads / sample** to `all` for full coverage — needed for
+    genomics variant calling; the default subsamples to 1,000,000 reads for fast lab runs.
+  - *Data matrix* — for **proteomics** and **methylation arrays**, whose data are *not* in
+    SRA. List a GEO series' supplementary files (or paste a direct URL, e.g. from
+    PRIDE/ProteomeXchange) and download the intensity/beta matrix — auto-decompressed and
+    ready to pass to `proteomics --intensities` or `methylation --method array --betas`.
 - **Process 450K/EPIC methylation arrays** — select "Methylation → 450K / EPIC array (GEO beta matrix)" and provide a beta-value CSV + metadata CSV directly
 
 To use a different port:

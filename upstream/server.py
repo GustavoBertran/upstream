@@ -64,6 +64,10 @@ class RunRequest(BaseModel):
     data_track: Optional[str] = None
     # geo download
     geo_samples: Optional[list] = None
+    reads: Optional[int] = None            # subsample target; 0/None for the default, <0 for all reads
+    # geo supplementary-matrix download (proteomics / methylation array)
+    suppl_url: Optional[str] = None
+    suppl_name: Optional[str] = None
     # track-specific index paths
     star_index: Optional[str] = None
     salmon_index: Optional[str] = None
@@ -112,6 +116,8 @@ def stream(run_id: str) -> StreamingResponse:
 
 
 def _preflight_issues(req: "RunRequest") -> list[str]:
+    if req.track == "download_suppl":
+        return []  # pure HTTP fetch — nothing to preflight
     if req.track == "download_geo":
         return [f"tool: '{t}' not found on PATH (activate the environment?)"
                 for t in preflight.missing_tools(preflight.required_tools("download_geo"))]
@@ -276,6 +282,9 @@ def _run_pipeline(run_id: str, req: RunRequest) -> None:
     if req.track == "download_geo":
         _run_geo_download(run_id, req)
         return
+    if req.track == "download_suppl":
+        _run_suppl_download(run_id, req)
+        return
 
     run = _runs[run_id]
     cmd = _build_cmd(req)
@@ -311,7 +320,10 @@ def _run_geo_download(run_id: str, req: RunRequest) -> None:
     outdir  = Path(req.outdir)
     outdir.mkdir(parents=True, exist_ok=True)
     samples = req.geo_samples or []
-    nreads  = 1_000_000
+    # reads: <0 → keep all reads (needed for variant calling, where 1M reads is far too
+    # little coverage); >0 → that many; None/0 → the teaching default.
+    full_reads = req.reads is not None and req.reads < 0
+    nreads = req.reads if (req.reads and req.reads > 0) else 1_000_000
     workers = min(4, len(samples)) or 1
 
     def append(text: str, cls: str = "out") -> None:
@@ -322,7 +334,8 @@ def _run_geo_download(run_id: str, req: RunRequest) -> None:
         with _runs_lock:
             return run["status"] == "cancelled"
 
-    missing = [t for t in ("prefetch", "fasterq-dump", "seqtk") if shutil.which(t) is None]
+    needed = ["prefetch", "fasterq-dump"] + ([] if full_reads else ["seqtk"])
+    missing = [t for t in needed if shutil.which(t) is None]
     if missing:
         append(f"✗ Required tool(s) not found on PATH: {', '.join(missing)}. "
                f"Activate the environment (conda activate upstream) and retry.", "error")
@@ -357,6 +370,11 @@ def _run_geo_download(run_id: str, req: RunRequest) -> None:
         return hits[0] if hits else None
 
     def subsample(src: Path, dest: Path) -> bool:
+        if full_reads:                       # keep every read — just compress
+            with dest.open("wb") as fh:
+                p = subprocess.Popen(["gzip", "-c", str(src)], stdout=fh)
+                p.wait()
+            return p.returncode == 0
         p1 = subprocess.Popen(["seqtk", "sample", "-s", "42", str(src), str(nreads)],
                               stdout=subprocess.PIPE)
         with dest.open("wb") as fh:
@@ -413,7 +431,8 @@ def _run_geo_download(run_id: str, req: RunRequest) -> None:
                 return {**base, "ok": False}
 
             # 3 — subsample + compress
-            append(f"[{name}] subsampling to {nreads:,} reads ({layout})…")
+            append(f"[{name}] " + (f"compressing full read set ({layout})…" if full_reads
+                    else f"subsampling to {nreads:,} reads ({layout})…"))
             for src, dest in jobs:
                 if cancelled():
                     return {**base, "ok": False}
@@ -431,7 +450,8 @@ def _run_geo_download(run_id: str, req: RunRequest) -> None:
             shutil.rmtree(sra_dir, ignore_errors=True)
 
     append(f"Downloading {len(samples)} sample(s), {workers} in parallel "
-           f"(prefetch → fasterq-dump → subsample)…", "step")
+           f"(prefetch → fasterq-dump → "
+           f"{'full reads' if full_reads else f'subsample {nreads:,}'})…", "step")
 
     results: list[dict] = []
     with _futures.ThreadPoolExecutor(max_workers=workers) as ex:
@@ -468,6 +488,90 @@ def _run_geo_download(run_id: str, req: RunRequest) -> None:
                "on single-end data is a separate step.", "out")
     append("Done. Run the pipeline with:", "success")
     append(f"  upstream rnaseq --samples {csv_path} --outdir results/", "cmd")
+    with _runs_lock:
+        run["status"] = "done"; run["exit_code"] = 0
+
+
+def _run_suppl_download(run_id: str, req: RunRequest) -> None:
+    """Download a GEO supplementary file (or any direct URL) → outdir; gunzip if needed.
+
+    The matrix-track download (proteomics intensity matrix, methylation-array beta
+    matrix) — a plain HTTP fetch, no SRA tools. The matrix parsers aren't gzip-aware,
+    so a .gz download is decompressed to the file the pipeline expects.
+    """
+    import gzip as _gzip
+    import urllib.request as _u
+
+    run = _runs[run_id]
+    outdir = Path(req.outdir or "data")
+    outdir.mkdir(parents=True, exist_ok=True)
+
+    def append(text: str, cls: str = "out") -> None:
+        with _runs_lock:
+            run["lines"].append({"text": text, "cls": cls})
+
+    def cancelled() -> bool:
+        with _runs_lock:
+            return run["status"] == "cancelled"
+
+    url = (req.suppl_url or "").strip()
+    if not url:
+        append("✗ No file URL provided.", "error")
+        with _runs_lock:
+            run["status"] = "error"; run["exit_code"] = 1
+        return
+
+    name = (req.suppl_name or url.rsplit("/", 1)[-1] or "download").split("?")[0]
+    dest = outdir / name
+    append(f"Downloading {name} → {dest}…", "step")
+    try:
+        with _u.urlopen(url, timeout=120) as resp:
+            total = int(resp.headers.get("Content-Length") or 0)
+            got, last_pct = 0, -1
+            with dest.open("wb") as fh:
+                while True:
+                    if cancelled():
+                        append("Run cancelled.", "error")
+                        dest.unlink(missing_ok=True)
+                        with _runs_lock:
+                            run["exit_code"] = 1
+                        return
+                    chunk = resp.read(262_144)
+                    if not chunk:
+                        break
+                    fh.write(chunk)
+                    got += len(chunk)
+                    if total:
+                        pct = int(got * 100 / total)
+                        if pct >= last_pct + 10:
+                            last_pct = pct
+                            append(f"  {pct}%  ({got:,} / {total:,} bytes)")
+        append(f"✓ Downloaded {got:,} bytes.", "ok")
+    except Exception as e:                       # noqa: BLE001 — surface, don't crash the run
+        append(f"✗ Download failed: {e}", "error")
+        dest.unlink(missing_ok=True)
+        with _runs_lock:
+            run["status"] = "error"; run["exit_code"] = 1
+        return
+
+    final = dest
+    if dest.suffix == ".gz":
+        unzipped = dest.with_suffix("")          # drop the .gz extension
+        append(f"Decompressing → {unzipped.name}…")
+        try:
+            with _gzip.open(dest, "rb") as gz, unzipped.open("wb") as out:
+                shutil.copyfileobj(gz, out)
+            dest.unlink(missing_ok=True)
+            final = unzipped
+            append("✓ Decompressed.", "ok")
+        except Exception as e:                   # noqa: BLE001
+            append(f"✗ Could not decompress (keeping the .gz): {e}", "error")
+            final = dest
+
+    append(f"✓ Saved → {final.resolve()}", "success")
+    append("This is a data matrix — pair it with a metadata CSV and run, e.g.:", "out")
+    append(f"  upstream proteomics  --intensities {final} --metadata meta.csv --outdir results/", "cmd")
+    append(f"  upstream methylation --method array --betas {final} --metadata meta.csv --outdir results/", "cmd")
     with _runs_lock:
         run["status"] = "done"; run["exit_code"] = 0
 
@@ -520,6 +624,16 @@ def geo_char(gse: str) -> dict:
     """Return sample characteristics from the GEO series matrix file."""
     from . import geo
     return geo.fetch_characteristics(gse)
+
+
+@app.get("/api/geo/suppl/{gse}")
+def geo_suppl(gse: str) -> dict:
+    """List a GEO series' supplementary files (intensity/beta matrices)."""
+    from . import geo
+    try:
+        return geo.fetch_supplementary_files(gse)
+    except ValueError as e:
+        raise HTTPException(404, str(e))
 
 
 @app.get("/api/browse")
@@ -862,6 +976,15 @@ input:checked+.slider::before{transform:translateX(14px)}
 
     <!-- GEO download panel (shown only for download track) -->
     <div id="geo-panel">
+      <div class="field full" style="max-width:560px">
+        <label>What to download</label>
+        <select id="inp-dl-mode" onchange="updateDownloadMode()">
+          <option value="fastq">Sequencing reads — FASTQ from SRA (genomics &middot; RNA-seq &middot; ATAC/ChIP &middot; WGBS)</option>
+          <option value="matrix">Data matrix — GEO supplementary / URL (proteomics &middot; methylation array)</option>
+        </select>
+      </div>
+
+      <div id="dl-fastq-section">
       <details class="info-note">
         <summary>Paired-end vs single-end reads</summary>
         <div class="info-note-body">
@@ -936,8 +1059,61 @@ input:checked+.slider::before{transform:translateX(14px)}
               <button class="browse-btn" aria-label="Browse for output directory" onclick="openBrowser('inp-geo-outdir','dir')">...</button>
             </div>
           </div>
+          <div class="field" style="max-width:175px">
+            <label>Reads / sample</label>
+            <input id="inp-geo-reads" type="text" value="1000000">
+            <div class="hint"><code>all</code> = full coverage (use for genomics)</div>
+          </div>
           <button class="btn" onclick="startGeoDownload()">Download selected</button>
           <span id="geo-dl-msg" role="alert" style="font-size:.74rem;color:var(--red)"></span>
+        </div>
+      </div>
+      </div><!-- /dl-fastq-section -->
+
+      <div id="dl-matrix-section" style="display:none">
+        <details class="info-note">
+          <summary>Downloading a data matrix (proteomics / methylation array)</summary>
+          <div class="info-note-body">
+            <p>Proteomics and microarray (450K/EPIC) data are not sequencing reads in
+            SRA &mdash; they are deposited as <strong>supplementary files</strong> on GEO
+            (a protein intensity matrix, or a beta-value matrix). Enter a GEO series to
+            list and download one, or paste a direct URL (e.g. from PRIDE / ProteomeXchange
+            or a journal). A <code>.gz</code> file is decompressed for you.</p>
+          </div>
+        </details>
+        <div class="geo-fetch-row">
+          <div class="field">
+            <label>GEO Series Accession</label>
+            <input id="inp-suppl-gse" type="text" placeholder="GSE59685"
+                   style="text-transform:uppercase"
+                   onkeydown="if(event.key==='Enter')listSuppl()">
+          </div>
+          <button class="btn ghost" id="btn-suppl" onclick="listSuppl()">List files</button>
+        </div>
+        <div id="suppl-msg" aria-live="polite" style="color:var(--red)"></div>
+        <div id="suppl-list" style="display:none">
+          <div class="geo-table-wrap">
+            <table class="geo-table">
+              <thead><tr><th>Supplementary file</th><th></th></tr></thead>
+              <tbody id="suppl-tbody"></tbody>
+            </table>
+          </div>
+        </div>
+        <div class="field" style="max-width:560px;margin-top:.7rem">
+          <label>Or paste a direct file URL</label>
+          <input id="inp-suppl-url" type="text"
+                 placeholder="https://… supplementary matrix (PRIDE / journal)">
+        </div>
+        <div class="geo-dl-row">
+          <div class="field" style="max-width:280px">
+            <label>Output directory</label>
+            <div class="field-row">
+              <input id="inp-suppl-outdir" type="text" value="data/">
+              <button class="browse-btn" aria-label="Browse for output directory" onclick="openBrowser('inp-suppl-outdir','dir')">...</button>
+            </div>
+          </div>
+          <button class="btn" onclick="downloadSupplUrl()">Download from URL</button>
+          <span id="suppl-dl-msg" role="alert" style="font-size:.74rem;color:var(--red)"></span>
         </div>
       </div>
     </div>
@@ -1043,6 +1219,7 @@ function selectTrack(id) {
   document.getElementById("standard-grid").style.display = isDownload ? "none" : "";
   document.getElementById("run-actions").style.display   = isDownload ? "none" : "";
   document.getElementById("geo-panel").style.display     = isDownload ? "block" : "none";
+  if (isDownload && typeof updateDownloadMode === "function") updateDownloadMode();
 
   // Reset the standard "Samples CSV" row: proteomics (and methylation-array, set later)
   // don't use a samplesheet. Resetting here also re-shows it when switching back from
@@ -1723,11 +1900,82 @@ async function startGeoDownload() {
       "Assign at least one disease and one control sample.";
     return;
   }
+  // Reads: "all" → full coverage (-1); a number → subsample size; blank/0 → server default.
+  var rawReads = (document.getElementById("inp-geo-reads") || {value:""}).value.trim().toLowerCase();
+  var reads = null;
+  if (rawReads === "all" || rawReads === "full") reads = -1;
+  else if (rawReads) { var n = parseInt(rawReads, 10); if (!isNaN(n)) reads = n; }
   await _kickoffRun(
-    {track:"download_geo", outdir:outdir, geo_samples:geoSamples},
+    {track:"download_geo", outdir:outdir, geo_samples:geoSamples, reads:reads},
     "Download Data",
     1   // samples download in parallel — one timed batch step
   );
+}
+
+// ── GEO supplementary-matrix download (proteomics / methylation array) ──────
+
+function updateDownloadMode() {
+  var mode = (document.getElementById("inp-dl-mode") || {value:"fastq"}).value;
+  var fastq = document.getElementById("dl-fastq-section");
+  var matrix = document.getElementById("dl-matrix-section");
+  if (fastq)  fastq.style.display  = mode === "matrix" ? "none" : "";
+  if (matrix) matrix.style.display = mode === "matrix" ? "" : "none";
+}
+
+async function listSuppl() {
+  var inp = document.getElementById("inp-suppl-gse");
+  var gse = inp.value.trim().toUpperCase(); inp.value = gse;
+  var msg = document.getElementById("suppl-msg");
+  var listDiv = document.getElementById("suppl-list");
+  msg.textContent = ""; msg.style.color = "var(--red)"; listDiv.style.display = "none";
+  if (!gse) { msg.textContent = "Enter a GSE accession."; return; }
+  var btn = document.getElementById("btn-suppl");
+  btn.disabled = true; btn.textContent = "Listing…";
+  try {
+    var res = await fetch("/api/geo/suppl/" + encodeURIComponent(gse));
+    var data = await res.json();
+    if (!res.ok) { msg.textContent = data.detail || "No supplementary files found."; return; }
+    var tb = document.getElementById("suppl-tbody");
+    tb.innerHTML = "";
+    data.files.forEach(function(f) {
+      var tr = document.createElement("tr");
+      var td1 = document.createElement("td");
+      td1.textContent = f.name;
+      td1.style.cssText = "font-family:monospace;font-size:.72rem";
+      var td2 = document.createElement("td");
+      var b = document.createElement("button");
+      b.className = "btn ghost"; b.textContent = "↓ Download";
+      b.style.cssText = "font-size:.72rem;padding:.2rem .6rem";
+      b.setAttribute("aria-label", "Download " + f.name);
+      (function(url, name){ b.onclick = function(){ downloadSuppl(url, name); }; })(f.url, f.name);
+      td2.appendChild(b);
+      tr.appendChild(td1); tr.appendChild(td2); tb.appendChild(tr);
+    });
+    listDiv.style.display = "";
+    msg.style.color = "var(--dim)";
+    msg.textContent = data.files.length + " file(s) — the matrix is usually the "
+      + "*_betas / *_intensities / counts file.";
+  } catch (e) {
+    msg.textContent = "Network error: " + e.message;
+  } finally {
+    btn.disabled = false; btn.textContent = "List files";
+  }
+}
+
+async function downloadSuppl(url, name) {
+  var outdir = (document.getElementById("inp-suppl-outdir") || {value:"data/"}).value.trim() || "data/";
+  await _kickoffRun(
+    {track:"download_suppl", outdir:outdir, suppl_url:url, suppl_name:name},
+    "Download matrix", 1
+  );
+}
+
+async function downloadSupplUrl() {
+  var url = (document.getElementById("inp-suppl-url") || {value:""}).value.trim();
+  var dmsg = document.getElementById("suppl-dl-msg");
+  dmsg.textContent = "";
+  if (!url) { dmsg.textContent = "Paste a file URL, or use the GEO list above."; return; }
+  await downloadSuppl(url, "");
 }
 
 // ── Pipeline run ──────────────────────────────────────────────────────────
@@ -1824,7 +2072,7 @@ async function startRun() {
 async function _kickoffRun(body, label, nsteps) {
   // Preflight: validate samplesheet, tools, and paths before starting (pipeline tracks;
   // the GEO download checks its own tools server-side). Surfaced in the setup form.
-  if (body.track !== "download_geo") {
+  if (body.track !== "download_geo" && body.track !== "download_suppl") {
     try {
       const cr = await (await fetch("/api/check", {
         method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify(body)
