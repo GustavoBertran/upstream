@@ -29,6 +29,27 @@ def run(cmd: list[str], cwd: Path | None = None) -> int:
     return result.returncode
 
 
+def run_capture(cmd: list[str], out_path: Path, cwd: Path | None = None) -> int:
+    """Run a command, writing its stdout to *out_path* (stderr still streams).
+
+    Like run(), but for tools whose report goes to stdout (e.g. `bcftools stats`).
+    Returns the exit code. Honors DRY_RUN.
+    """
+    display = " ".join(str(c) for c in cmd)
+    if DRY_RUN:
+        console.print(f"\n[yellow][dry-run][/yellow] [dim]$ {display} > {out_path}[/dim]")
+        return 0
+    console.print(f"\n[dim]$ {display} > {out_path}[/dim]\n")
+    with open(out_path, "w") as fh:
+        result = subprocess.run(
+            [str(c) for c in cmd],
+            cwd=str(cwd) if cwd else None,
+            stdout=fh,
+            stderr=sys.stderr,
+        )
+    return result.returncode
+
+
 def pipe(cmd_a: list[str], cmd_b: list[str], cwd: Path | None = None) -> int:
     """Run cmd_a | cmd_b, streaming stderr of both. Returns cmd_b exit code."""
     display_a = " ".join(str(c) for c in cmd_a)

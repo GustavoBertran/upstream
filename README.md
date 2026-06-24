@@ -1,8 +1,13 @@
 # Welcome to upstream
 
-`upstream` is a command-line preprocessing pipeline for high-throughput sequencing (HTS) data.
-It wraps FastQC, fastp, STAR, Salmon, Bowtie2, MACS2, and Bismark into four simple commands
-and produces output matrices compatible with the [OBAMA pipeline](https://github.com/AOG-Lab/OBAMA).
+`upstream` is a command-line bioinformatics pipeline for high-throughput sequencing (HTS) data,
+organized by domain — **Genomics** (variant calling), **Transcriptomics** (RNA-seq),
+**Epigenomics** (ATAC-seq, ChIP-seq, methylation), and **Proteomics** (intensity-matrix
+analysis), plus quality control. It wraps standard tools (FastQC, fastp, BWA, bcftools, STAR,
+Salmon, Bowtie2, MACS2, Bismark) behind one consistent command per analysis type. The
+transcriptomics track produces matrices compatible with the
+[OBAMA pipeline](https://github.com/AOG-Lab/OBAMA); the other tracks emit the standard outputs
+for their field (VCF for genomics; DESeq2/edgeR/limma count matrices elsewhere).
 
 ---
 
@@ -46,7 +51,8 @@ Then open **http://localhost:8421** in your browser.
 
 The interface lets you:
 - **Browse** your filesystem to fill in file/folder paths (click the `...` button next to any input)
-- **Select a track** in the sidebar (RNA-seq, ATAC-seq, Methylation, QC, Download Data)
+- **Select a track** in the sidebar, grouped by domain (Genomics, Transcriptomics, Epigenomics,
+  Proteomics, plus QC and Download Data)
 - **Stream output** live as the pipeline runs
 - **Download GEO data** — type a GSE accession, assign disease/control groups, and download FASTQ files with one click
 - **Process 450K/EPIC methylation arrays** — select "Methylation → 450K / EPIC array (GEO beta matrix)" and provide a beta-value CSV + metadata CSV directly
@@ -80,6 +86,23 @@ upstream qc \
   --samples samples.csv \
   --outdir results/qc/
 ```
+
+**Genomics — germline variant calling (BWA-MEM → bcftools):**
+```bash
+upstream genomics \
+  --samples samples.csv \
+  --reference /path/to/hg38.fa \
+  --outdir results/genomics/
+```
+
+Each sample is trimmed (fastp), aligned (BWA-MEM), duplicate-marked (samtools), and called
+with `bcftools mpileup | call`, producing a per-sample `variants/<name>.vcf.gz`. With `--merge`
+(default) the per-sample VCFs are combined into `cohort.vcf.gz`; a `variant_summary.csv` reports
+SNP/indel counts and ts/tv per sample. **No OBAMA matrix** — variant calling's natural output is a
+VCF. The reference FASTA needs its BWA index (`.bwt` …) and `.fai` alongside it — run
+`upstream index-help --tool bwa --genome human` for the build commands. For production work the
+GATK Best Practices pipeline (HaplotypeCaller/GenotypeGVCFs) is the gold standard; this track uses
+bcftools as a lighter, teachable equivalent.
 
 **RNA-seq (Salmon, alignment-free — default):**
 ```bash
@@ -190,6 +213,36 @@ upstream methylation \
 The beta matrix should have probe IDs (e.g. `cg00000029`) as rows and GSM
 accession IDs as columns — the standard format for GEO supplementary files.
 
+**Proteomics — intensity matrix → limma matrix:**
+
+```bash
+upstream proteomics \
+  --intensities proteinGroups.txt \
+  --metadata metadata.csv \
+  --input-type maxquant \
+  --outdir results/proteomics/
+```
+
+Starts from a MaxQuant `proteinGroups.txt` (the most common label-free output) or a generic
+protein × sample matrix (`--input-type matrix`). It drops contaminant/reverse hits, keeps
+proteins quantified in enough samples per group (`--min-valid`, default 0.5), `log2`-transforms,
+normalizes (`--normalize median` by default, or `quantile`/`none`), and writes
+`proteins_matrix.csv` + `coldata.csv` for **limma** differential abundance. Pure Python — no
+external tools, no OBAMA. The raw-spectra → matrix step (MaxQuant/FragPipe) runs upstream and is
+out of scope, just as the methylation array track starts from a GEO beta matrix rather than raw
+IDATs.
+
+The metadata CSV has two columns — `sample` (matching the quant-column sample names) and `group`
+(`disease`/`control`):
+
+```csv
+sample,group
+Sample_01,disease
+Sample_02,disease
+Sample_03,control
+Sample_04,control
+```
+
 ---
 
 ## Options
@@ -232,7 +285,7 @@ results/
 
 ## Reference Indices
 
-Don't have an index yet? Run **`upstream index-help --tool <salmon|star|bowtie2|bismark> --genome <human|mouse>`**
+Don't have an index yet? Run **`upstream index-help --tool <salmon|star|bowtie2|bismark|bwa> --genome <human|mouse>`**
 to print the exact commands to download the reference (GENCODE) and build it. (It only
 prints guidance — STAR needs ~30 GB RAM and Bismark ~100 GB disk to build, so run those on
 a server.) A missing index at run time points you to this command automatically.
@@ -246,6 +299,7 @@ for the exact commands. Typical locations on a shared server:
 | Salmon (hg38) | `/data/upstream/indices/salmon_hg38` |
 | Bowtie2 (hg38) | `/data/upstream/indices/bowtie2_hg38/hg38` |
 | Bismark (hg38) | `/data/upstream/indices/bismark_hg38` |
+| BWA (hg38) | `/data/upstream/indices/bwa_hg38/hg38.fa` (with `.bwt`/`.fai` sidecars) |
 
 ---
 

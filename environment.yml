@@ -19,6 +19,9 @@ dependencies:
   - deeptools=3.5.5
   # Methylation
   - bismark=0.24.2
+  # Genomics (germline variant calling)
+  - bwa=0.7.18
+  - bcftools=1.21   # matches samtools 1.21 (shared htslib)
   # Shared utilities
   - sra-tools=3.1   # prefetch + fasterq-dump (GEO/SRA download)
   - seqtk=1.4

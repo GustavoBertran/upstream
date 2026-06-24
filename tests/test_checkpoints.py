@@ -1,5 +1,6 @@
 """Tests for htsprep.checkpoints validation functions."""
 
+import gzip
 import json
 import textwrap
 from pathlib import Path
@@ -176,3 +177,109 @@ def test_obama_no_features(tmp):
 def test_obama_missing_file(tmp):
     ok, _ = checkpoints.check_obama_format(tmp / "missing.csv")
     assert not ok
+
+
+# ── Genomics ──────────────────────────────────────────────────────────────
+
+
+def test_check_bwa_bam_pass(tmp):
+    bam = tmp / "s.sorted.bam"
+    bam.write_bytes(b"x" * 2048)
+    (tmp / "s.sorted.bam.bai").write_bytes(b"i")
+    ok, msg = checkpoints.check_bwa_bam(bam)
+    assert ok and "indexed" in msg
+
+
+def test_check_bwa_bam_no_index(tmp):
+    bam = tmp / "s.sorted.bam"
+    bam.write_bytes(b"x" * 2048)
+    ok, msg = checkpoints.check_bwa_bam(bam)
+    assert not ok and "index" in msg.lower()
+
+
+def test_check_markdup_bam_pass(tmp):
+    bam = tmp / "s.markdup.bam"
+    bam.write_bytes(b"x" * 2048)
+    (tmp / "s.markdup.bam.bai").write_bytes(b"i")
+    ok, msg = checkpoints.check_markdup_bam(bam)
+    assert ok and "Duplicates marked" in msg
+
+
+def test_check_markdup_bam_missing(tmp):
+    ok, _ = checkpoints.check_markdup_bam(tmp / "missing.bam")
+    assert not ok
+
+
+def _write_vcf_gz(path: Path, records: int, header: bool = True) -> None:
+    lines = ["##fileformat=VCFv4.2"]
+    if header:
+        lines.append("#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\ts1")
+    for i in range(records):
+        lines.append(f"chr1\t{1000 + i}\t.\tA\tG\t50\tPASS\t.\tGT\t0/1")
+    with gzip.open(path, "wt") as f:
+        f.write("\n".join(lines) + "\n")
+
+
+def test_check_vcf_pass(tmp):
+    v = tmp / "s.vcf.gz"
+    _write_vcf_gz(v, records=12)
+    ok, msg = checkpoints.check_vcf(v)
+    assert ok and "12" in msg
+
+
+def test_check_vcf_no_records_soft_pass(tmp):
+    v = tmp / "s.vcf.gz"
+    _write_vcf_gz(v, records=0)
+    ok, msg = checkpoints.check_vcf(v)
+    assert ok and "no variant" in msg.lower()
+
+
+def test_check_vcf_malformed_no_header(tmp):
+    v = tmp / "s.vcf.gz"
+    with gzip.open(v, "wt") as f:
+        f.write("##fileformat=VCFv4.2\nchr1\t100\t.\tA\tG\t50\tPASS\t.\n")
+    ok, msg = checkpoints.check_vcf(v)
+    assert not ok and "header" in msg.lower()
+
+
+def test_check_vcf_missing(tmp):
+    ok, _ = checkpoints.check_vcf(tmp / "missing.vcf.gz")
+    assert not ok
+
+
+def test_check_variant_summary_pass(tmp):
+    p = tmp / "variant_summary.csv"
+    p.write_text("sample,group,total_records,snps,indels,ts_tv\n"
+                 "s1,disease,1200,1000,200,2.05\n")
+    ok, msg = checkpoints.check_variant_summary(p)
+    assert ok and "1 sample" in msg
+
+
+def test_check_variant_summary_header_only(tmp):
+    p = tmp / "variant_summary.csv"
+    p.write_text("sample,group,total_records,snps,indels,ts_tv\n")
+    ok, _ = checkpoints.check_variant_summary(p)
+    assert not ok
+
+
+def test_check_variant_summary_missing(tmp):
+    ok, _ = checkpoints.check_variant_summary(tmp / "missing.csv")
+    assert not ok
+
+
+# ── Proteomics matrix (reuses check_counts_matrix) ────────────────────────
+
+
+def test_check_counts_matrix_proteomics_pass(tmp):
+    # float values + a blank (missing) cell must not break the matrix validator
+    (tmp / "proteins_matrix.csv").write_text("protein,S1,S2\nP1,12.3,11.9\nP2,,10.5\n")
+    (tmp / "coldata.csv").write_text("sample,condition\nS1,disease\nS2,control\n")
+    ok, msg = checkpoints.check_counts_matrix(tmp / "proteins_matrix.csv", tmp / "coldata.csv")
+    assert ok and "2 feature" in msg
+
+
+def test_check_counts_matrix_proteomics_bad_condition(tmp):
+    (tmp / "proteins_matrix.csv").write_text("protein,S1,S2\nP1,12.3,11.9\n")
+    (tmp / "coldata.csv").write_text("sample,condition\nS1,tumor\nS2,control\n")
+    ok, msg = checkpoints.check_counts_matrix(tmp / "proteins_matrix.csv", tmp / "coldata.csv")
+    assert not ok and "tumor" in msg
