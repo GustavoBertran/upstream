@@ -801,6 +801,9 @@ body.picker-open .sidebar,body.picker-open .main{display:none}
 .profile-card .pc-blurb{font-size:.8rem;color:var(--dim);margin-top:.3rem;line-height:1.5}
 .profile-card .pc-meta{font-size:.7rem;color:var(--accent);margin-top:.5rem}
 .profile-card[disabled]{opacity:.45;cursor:not-allowed}
+.profile-card.pc-last{border-color:var(--accent)}
+.pc-last-tag{display:inline-block;margin-left:.5rem;font-size:.62rem;color:var(--accent);
+             border:1px solid var(--accent);border-radius:10px;padding:.02rem .42rem;vertical-align:middle}
 .picker-warn{color:var(--yellow);font-size:.72rem;margin-top:1rem}
 /* main */
 .main{flex:1;display:flex;flex-direction:column;padding:1.75rem;gap:1.25rem;
@@ -1344,6 +1347,8 @@ function showPicker() {
   var warn = document.getElementById("picker-warn"); if (warn) warn.textContent = "";
   var wrap = document.getElementById("picker-cards");
   wrap.innerHTML = "";
+  var lastUsed = null;
+  try { lastUsed = localStorage.getItem("us:profile"); } catch(e) {}
   if (!PROFILES.length && warn) warn.textContent = "No profiles configured (upstream/profiles.json).";
   PROFILES.forEach(function(p){
     var res = resolveTracks(p);
@@ -1366,6 +1371,12 @@ function showPicker() {
       card.querySelector(".pc-meta").textContent = "no available tracks";
     } else {
       (function(pid){ card.onclick = function(){ enterProfile(pid); }; })(p.id);
+      if (p.id === lastUsed) {   // mark the previously-chosen lab for quick re-selection
+        card.classList.add("pc-last");
+        var tag = document.createElement("span");
+        tag.className = "pc-last-tag"; tag.textContent = "last used";
+        card.querySelector(".pc-meta").appendChild(tag);
+      }
       if (res.bad.length && warn) {
         warn.textContent = "Note: some configured track ids were not recognized and were skipped "
           + "(see the browser console).";
@@ -1373,8 +1384,10 @@ function showPicker() {
     }
     wrap.appendChild(card);
   });
-  var firstCard = wrap.querySelector(".profile-card:not([disabled])");
-  if (firstCard) firstCard.focus();
+  // focus the last-used lab if present, else the first selectable card
+  var focusCard = wrap.querySelector(".profile-card.pc-last")
+               || wrap.querySelector(".profile-card:not([disabled])");
+  if (focusCard) focusCard.focus();
 }
 
 function enterProfile(id) {
@@ -2677,16 +2690,9 @@ function _assocLabels() {
   });
 })();
 
-// Startup: restore the last-used lab group, else show the picker first.
-(function() {
-  var saved = null;
-  try { saved = localStorage.getItem("us:profile"); } catch(e) {}
-  if (saved && _profileById(saved) && resolveTracks(_profileById(saved)).valid.length) {
-    enterProfile(saved);
-  } else {
-    showPicker();
-  }
-})();
+// Startup: always show the lab-group picker first (the previously-used lab, if any,
+// is highlighted inside the picker for one-click re-selection).
+showPicker();
 _restoreInputs();
 _assocLabels();
 </script>
