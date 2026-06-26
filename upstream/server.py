@@ -105,7 +105,7 @@ _DEFAULT_PROFILES = {
          "blurb": "Transcriptomics and the OBAMA pipelines — QC, RNA-seq, ATAC-seq, Methylation, and Download.",
          "image": "aog.png",
          "tracks": ["qc", "rnaseq", "atacseq", "methylation", "download"]},
-        {"id": "all", "name": "Whole department",
+        {"id": "all", "name": "All pipelines",
          "blurb": "Every pipeline upstream provides, across all domains.",
          "tracks": ["*"]},
     ]

@@ -10,7 +10,7 @@
     },
     {
       "id": "all",
-      "name": "Whole department",
+      "name": "All pipelines",
       "blurb": "Every pipeline upstream provides, across all domains.",
       "tracks": ["*"]
     }
