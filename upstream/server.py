@@ -25,6 +25,7 @@ from typing import Optional
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse, StreamingResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from . import __version__, diagnostics, preflight
@@ -33,6 +34,11 @@ from .samplesheet import scan_fastq_dir
 _ANSI_RE = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]")
 
 app = FastAPI(title="upstream", docs_url=None, redoc_url=None)
+
+# Serve profile logos (and any other static assets) from upstream/static/.
+_STATIC_DIR = Path(__file__).parent / "static"
+if _STATIC_DIR.is_dir():
+    app.mount("/static", StaticFiles(directory=str(_STATIC_DIR)), name="static")
 
 # run_id → {"status": "running"|"done"|"error"|"cancelled",
 #            "lines": [{"text": str, "cls": str}],
@@ -93,9 +99,47 @@ class RunRequest(BaseModel):
 # ── Routes ────────────────────────────────────────────────────────────────
 
 
+_DEFAULT_PROFILES = {
+    "profiles": [
+        {"id": "aog", "name": "Applied Optimization Group (AOG)",
+         "blurb": "Transcriptomics and the OBAMA pipelines — QC, RNA-seq, ATAC-seq, Methylation, and Download.",
+         "image": "aog.png",
+         "tracks": ["qc", "rnaseq", "atacseq", "methylation", "download"]},
+        {"id": "all", "name": "Whole department",
+         "blurb": "Every pipeline upstream provides, across all domains.",
+         "tracks": ["*"]},
+    ]
+}
+
+
+def load_profiles() -> dict:
+    """Load lab-group profiles from upstream/profiles.json (department-editable).
+
+    Falls back to a built-in default if the file is missing or malformed, so the UI
+    always renders. Unknown track ids in a profile are filtered out client-side with
+    a visible warning. Profiles are navigation only — they do not restrict the CLI.
+    """
+    path = Path(__file__).parent / "profiles.json"
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        profs = data.get("profiles")
+        if isinstance(profs, list):
+            cleaned = [p for p in profs
+                       if isinstance(p, dict) and p.get("id") and isinstance(p.get("tracks"), list)]
+            if cleaned:
+                return {"profiles": cleaned}
+    except Exception:
+        pass
+    return _DEFAULT_PROFILES
+
+
 @app.get("/", response_class=HTMLResponse)
 def index() -> str:
-    return _HTML.replace("{{VERSION}}", __version__)
+    # json.dumps is valid JS; escape "<" so a blurb can't break out of <script>.
+    profiles_js = json.dumps(load_profiles()).replace("<", "\\u003c")
+    return (_HTML
+            .replace("{{VERSION}}", __version__)
+            .replace("{{PROFILES}}", profiles_js))
 
 
 @app.post("/api/run")
@@ -730,6 +774,34 @@ body{background:var(--bg);color:var(--text);font-family:system-ui,sans-serif;
 .track-btn .td{font-size:.68rem;color:var(--dim);margin-top:.15rem;line-height:1.3}
 .sidebar-footer{margin-top:auto;font-size:.68rem;color:var(--dim);line-height:1.6;
                 padding-top:.75rem;border-top:1px solid var(--border)}
+/* lab-group badge + switcher (sidebar) */
+.lab-badge{display:flex;align-items:center;gap:.5rem;font-size:.7rem;color:var(--dim);
+           margin:-.4rem 0 .2rem;flex-wrap:wrap}
+.lab-badge #lab-name{color:var(--bright);font-weight:600}
+.lab-logo{width:18px;height:18px;border-radius:4px;background:#fff;object-fit:contain;flex-shrink:0}
+.lab-switch{background:none;border:none;color:var(--accent);cursor:pointer;font-size:.7rem;padding:0}
+.lab-switch:hover{text-decoration:underline}
+/* profile picker (landing) */
+.profile-picker{position:fixed;inset:0;z-index:200;background:var(--bg);
+                display:none;align-items:center;justify-content:center;padding:2rem;overflow-y:auto}
+.profile-picker.open{display:flex}
+body.picker-open .sidebar,body.picker-open .main{display:none}
+.picker-box{width:100%;max-width:560px}
+.picker-title{font-size:1.4rem;color:var(--accent);font-weight:700;letter-spacing:.05em;margin-bottom:.4rem}
+.picker-sub{color:var(--dim);font-size:.9rem;margin-bottom:1.4rem}
+.picker-cards{display:flex;flex-direction:column;gap:.7rem}
+.profile-card{display:flex;align-items:center;gap:.95rem;width:100%;text-align:left;background:var(--bg2);
+              border:1px solid var(--border);border-radius:8px;padding:1rem 1.1rem;
+              cursor:pointer;color:var(--text);transition:border-color .15s,background .15s}
+.profile-card:hover,.profile-card:focus-visible{border-color:var(--accent);background:var(--bg3)}
+.profile-card .pc-logo{width:48px;height:48px;border-radius:8px;background:#fff;
+                       object-fit:contain;flex-shrink:0}
+.profile-card .pc-text{min-width:0}
+.profile-card .pc-name{font-weight:700;font-size:1rem;color:var(--bright)}
+.profile-card .pc-blurb{font-size:.8rem;color:var(--dim);margin-top:.3rem;line-height:1.5}
+.profile-card .pc-meta{font-size:.7rem;color:var(--accent);margin-top:.5rem}
+.profile-card[disabled]{opacity:.45;cursor:not-allowed}
+.picker-warn{color:var(--yellow);font-size:.72rem;margin-top:1rem}
 /* main */
 .main{flex:1;display:flex;flex-direction:column;padding:1.75rem;gap:1.25rem;
       overflow-y:auto;min-width:0}
@@ -781,6 +853,17 @@ input:checked+.slider::before{transform:translateX(14px)}
 .srr-cell{font-family:monospace;color:var(--cyan);font-size:.72rem}
 .srr-err{color:var(--red);font-size:.72rem}
 .geo-dl-row{display:flex;align-items:flex-end;gap:.875rem;flex-wrap:wrap}
+/* bulk-assign + search toolbar */
+.geo-bulk{display:flex;flex-wrap:wrap;gap:.4rem;align-items:center;margin-bottom:.6rem}
+.geo-search{flex:1;min-width:180px;max-width:340px;background:var(--bg2);
+            border:1px solid var(--border);border-radius:4px;color:var(--bright);
+            font-size:.78rem;padding:.32rem .55rem;outline:none}
+.geo-search:focus{border-color:var(--accent)}
+.geo-bulk-lbl{font-size:.72rem;color:var(--dim);margin-left:.3rem}
+.geo-bulk-count{font-size:.7rem;color:var(--dim);margin-left:auto}
+.geo-bulk .btn{font-size:.72rem;padding:.28rem .6rem}
+.geo-bulk .btn.grp-disease{border-color:var(--red);color:var(--red)}
+.geo-bulk .btn.grp-control{border-color:var(--cyan);color:var(--cyan)}
 /* log panel */
 #log-panel{flex:1;display:flex;flex-direction:column;gap:.75rem;min-height:0}
 .log-header{display:flex;justify-content:space-between;align-items:flex-start;flex-shrink:0}
@@ -893,8 +976,23 @@ input:checked+.slider::before{transform:translateX(14px)}
 </head>
 <body>
 
+<!-- Lab-group picker (landing) — shown until a profile is chosen -->
+<div class="profile-picker" id="profile-picker" role="dialog" aria-modal="true" aria-label="Select your lab group">
+  <div class="picker-box">
+    <h1 class="picker-title"><span aria-hidden="true">&#9889;</span> upstream</h1>
+    <p class="picker-sub">Select your lab group to see its pipelines.</p>
+    <div id="picker-cards" class="picker-cards"></div>
+    <div id="picker-warn" class="picker-warn" role="alert"></div>
+  </div>
+</div>
+
 <div class="sidebar">
   <h1><span aria-hidden="true">&#9889;</span> upstream</h1>
+  <div class="lab-badge">
+    <img id="lab-logo" class="lab-logo" alt="" style="display:none">
+    <span id="lab-name"></span>
+    <button class="lab-switch" onclick="switchLab()">&#8646; switch lab</button>
+  </div>
   <nav aria-label="Pipeline track">
     <h2 id="track-heading">Track</h2>
     <div id="track-list" aria-labelledby="track-heading"
@@ -1019,6 +1117,16 @@ input:checked+.slider::before{transform:translateX(14px)}
       <div id="geo-results" style="display:none">
         <div id="geo-series-info"></div>
         <div id="geo-facets"></div>
+        <div class="geo-bulk">
+          <input id="geo-search" type="text" class="geo-search"
+                 placeholder="Filter by GSM, title, or characteristic…"
+                 aria-label="Filter samples" oninput="geoSearch(this.value)">
+          <span class="geo-bulk-lbl">Assign shown:</span>
+          <button class="btn ghost grp-disease" onclick="bulkAssign('disease')">&rarr; disease</button>
+          <button class="btn ghost grp-control" onclick="bulkAssign('control')">&rarr; control</button>
+          <button class="btn ghost" onclick="bulkAssign('skip')">&rarr; skip</button>
+          <span id="geo-bulk-count" class="geo-bulk-count"></span>
+        </div>
         <div class="geo-table-wrap">
           <table class="geo-table" id="geo-table">
             <thead id="geo-thead"></thead>
@@ -1178,12 +1286,43 @@ const EXTRA_INFO = {
 
 let track = null, runId = null, sse = null, stepIdx = 0, _runNsteps = 0;
 
-// Build sidebar — grouped by domain (each domain gets a visible <h2> heading inside
-// #track-list; the nav's accessible name stays "Track" via aria-labelledby).
-(function() {
+// ── Lab-group profiles (department-editable, navigation only) ───────────────
+const PROFILE_CFG = {{PROFILES}};
+const PROFILES = (PROFILE_CFG && PROFILE_CFG.profiles) || [];
+let _currentProfile = null;
+
+function _profileById(id) {
+  for (var i = 0; i < PROFILES.length; i++) if (PROFILES[i].id === id) return PROFILES[i];
+  return null;
+}
+
+// A profile's logo: a full URL/absolute path as-is, else a file under /static/.
+function _profileImgSrc(image) {
+  if (!image) return null;
+  if (image.indexOf("http://") === 0 || image.indexOf("https://") === 0 ||
+      image.charAt(0) === "/") return image;
+  return "/static/" + image;
+}
+
+// Resolve a profile's track ids to the ones that actually exist ("*" = all);
+// unknown ids are skipped with a visible warning rather than silently vanishing.
+function resolveTracks(profile) {
+  var ids = (profile.tracks || []).slice();
+  if (ids.indexOf("*") !== -1) ids = Object.keys(TRACKS);
+  var valid = [], bad = [];
+  ids.forEach(function(id){ (TRACKS[id] ? valid : bad).push(id); });
+  if (bad.length) console.warn("profile '"+profile.id+"' references unknown track id(s): "+bad.join(", "));
+  return {valid: valid, bad: bad};
+}
+
+// Build the sidebar scoped to a set of track ids, grouped by domain.
+function buildSidebar(allowed) {
   const tl = document.getElementById("track-list");
+  tl.innerHTML = "";
   for (const dom of DOMAINS) {
-    const entries = Object.entries(TRACKS).filter(function(e){ return e[1].group === dom; });
+    const entries = Object.entries(TRACKS).filter(function(e){
+      return e[1].group === dom && allowed.indexOf(e[0]) !== -1;
+    });
     if (!entries.length) continue;
     const h = document.createElement("h2");
     h.className = "track-domain"; h.textContent = dom;
@@ -1197,7 +1336,68 @@ let track = null, runId = null, sse = null, stepIdx = 0, _runNsteps = 0;
       tl.appendChild(b);
     }
   }
-})();
+}
+
+function showPicker() {
+  document.body.classList.add("picker-open");
+  document.getElementById("profile-picker").classList.add("open");
+  var warn = document.getElementById("picker-warn"); if (warn) warn.textContent = "";
+  var wrap = document.getElementById("picker-cards");
+  wrap.innerHTML = "";
+  if (!PROFILES.length && warn) warn.textContent = "No profiles configured (upstream/profiles.json).";
+  PROFILES.forEach(function(p){
+    var res = resolveTracks(p);
+    var card = document.createElement("button");
+    card.className = "profile-card"; card.type = "button";
+    var n = res.valid.length;
+    card.innerHTML = '<div class="pc-text"><div class="pc-name"></div>'
+      + '<div class="pc-blurb"></div>'
+      + '<div class="pc-meta">'+n+' track'+(n===1?'':'s')+'</div></div>';
+    var src = _profileImgSrc(p.image);
+    if (src) {  // build via DOM (not innerHTML) so the src can't break out of the attribute
+      var img = document.createElement("img");
+      img.className = "pc-logo"; img.src = src; img.alt = "";
+      card.insertBefore(img, card.firstChild);
+    }
+    card.querySelector(".pc-name").textContent = p.name || p.id;
+    card.querySelector(".pc-blurb").textContent = p.blurb || "";
+    if (!n) {
+      card.disabled = true;
+      card.querySelector(".pc-meta").textContent = "no available tracks";
+    } else {
+      (function(pid){ card.onclick = function(){ enterProfile(pid); }; })(p.id);
+      if (res.bad.length && warn) {
+        warn.textContent = "Note: some configured track ids were not recognized and were skipped "
+          + "(see the browser console).";
+      }
+    }
+    wrap.appendChild(card);
+  });
+  var firstCard = wrap.querySelector(".profile-card:not([disabled])");
+  if (firstCard) firstCard.focus();
+}
+
+function enterProfile(id) {
+  var p = _profileById(id);
+  if (!p) { showPicker(); return; }
+  var res = resolveTracks(p);
+  if (!res.valid.length) { showPicker(); return; }
+  _currentProfile = id;
+  try { localStorage.setItem("us:profile", id); } catch(e) {}
+  buildSidebar(res.valid);
+  document.getElementById("lab-name").textContent = p.name || p.id;
+  var logo = document.getElementById("lab-logo");
+  var lsrc = _profileImgSrc(p.image);
+  if (logo) {
+    if (lsrc) { logo.src = lsrc; logo.style.display = ""; }
+    else { logo.removeAttribute("src"); logo.style.display = "none"; }
+  }
+  document.body.classList.remove("picker-open");
+  document.getElementById("profile-picker").classList.remove("open");
+  selectTrack(res.valid[0]);   // default to the profile's first track
+}
+
+function switchLab() { showPicker(); }
 
 function selectTrack(id) {
   if (runId) return;
@@ -1458,6 +1658,7 @@ function updateMethylationMethod() {
 var _geoRows = [];
 var _geoCharKeys = [];
 var _geoFilters = {};
+var _geoSearch = "";
 var _geoSortCol = null;
 var _geoSortAsc = true;
 
@@ -1467,10 +1668,16 @@ function geoMsg(msg, color) {
 }
 
 function _geoSortedFiltered() {
+  var q = _geoSearch;
   var rows = _geoRows.filter(function(row) {
     for (var col in _geoFilters) {
       var allowed = _geoFilters[col];
       if (allowed.size > 0 && !allowed.has(String(row[col] || ""))) return false;
+    }
+    if (q) {  // free-text search across GSM, title, and every characteristic value
+      var hay = (row.gsm || "") + " " + (row.title || "");
+      for (var ki = 0; ki < _geoCharKeys.length; ki++) hay += " " + (row[_geoCharKeys[ki]] || "");
+      if (hay.toLowerCase().indexOf(q) === -1) return false;
     }
     return true;
   });
@@ -1635,6 +1842,8 @@ function renderGeoTable() {
   var tbody = document.getElementById("geo-tbody");
   if (!tbody) return;
   var rows = _geoSortedFiltered();
+  var bc = document.getElementById("geo-bulk-count");
+  if (bc) bc.textContent = rows.length + " of " + _geoRows.length + " shown";
   tbody.innerHTML = "";
   for (var i = 0; i < rows.length; i++) {
     var row = rows[i];
@@ -1791,6 +2000,20 @@ function resetGeoGroups() {
   renderGeoTable();  // re-renders dropdowns from _geoRows (summary re-renders inside)
 }
 
+// Free-text filter over the sample table — composes with the facet filters.
+function geoSearch(val) {
+  _geoSearch = (val || "").trim().toLowerCase();
+  renderGeoTable();
+}
+
+// Assign a group to every CURRENTLY-SHOWN row (after facets + search), so you can
+// filter to a subset and label it all at once instead of row by row.
+function bulkAssign(group) {
+  var shown = _geoSortedFiltered();
+  for (var i = 0; i < shown.length; i++) shown[i].group = group;
+  renderGeoTable();
+}
+
 async function fetchGSE() {
   var inp = document.getElementById("inp-gse");
   var gse = inp.value.trim().toUpperCase();
@@ -1800,7 +2023,9 @@ async function fetchGSE() {
   var btn = document.getElementById("btn-fetch");
   btn.disabled = true; btn.textContent = "Fetching…";
   _geoRows = []; _geoCharKeys = []; _geoFilters = {};
-  _geoSortCol = null; _geoSortAsc = true;
+  _geoSearch = ""; _geoSortCol = null; _geoSortAsc = true;
+  var searchInp = document.getElementById("geo-search");
+  if (searchInp) searchInp.value = "";
   var panel = document.getElementById("geo-facets");
   if (panel) { panel.innerHTML = ""; panel.style.display = "none"; }
   var sumDiv = document.getElementById("geo-summary");
@@ -2452,7 +2677,16 @@ function _assocLabels() {
   });
 })();
 
-selectTrack("rnaseq");
+// Startup: restore the last-used lab group, else show the picker first.
+(function() {
+  var saved = null;
+  try { saved = localStorage.getItem("us:profile"); } catch(e) {}
+  if (saved && _profileById(saved) && resolveTracks(_profileById(saved)).valid.length) {
+    enterProfile(saved);
+  } else {
+    showPicker();
+  }
+})();
 _restoreInputs();
 _assocLabels();
 </script>

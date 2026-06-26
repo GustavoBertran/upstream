@@ -21,4 +21,4 @@ upstream = "upstream.cli:app"
 where = ["."]
 
 [tool.setuptools.package-data]
-upstream = ["content/**/*.md"]
+upstream = ["content/**/*.md", "profiles.json", "static/*"]

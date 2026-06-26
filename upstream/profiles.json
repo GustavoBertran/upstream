@@ -1,0 +1,18 @@
+{
+  "_comment": "Lab-group profiles for the Biology Department. Each profile scopes the web UI sidebar to the tracks that group uses. To add a lab: copy a block, give it a unique id, a name/blurb, and list its track ids. Optional 'image' = a logo: a filename placed in upstream/static/ (png/jpg/svg) or a full https URL. Valid track ids: qc, genomics, rnaseq, atacseq, chipseq, methylation, proteomics, download. Use [\"*\"] for every track. This is navigation only — it does not restrict the CLI or lock anyone out.",
+  "profiles": [
+    {
+      "id": "aog",
+      "name": "Applied Optimization Group (AOG)",
+      "blurb": "Transcriptomics and the OBAMA pipelines — QC, RNA-seq, ATAC-seq, Methylation, and Download.",
+      "image": "aog.png",
+      "tracks": ["qc", "rnaseq", "atacseq", "methylation", "download"]
+    },
+    {
+      "id": "all",
+      "name": "Whole department",
+      "blurb": "Every pipeline upstream provides, across all domains.",
+      "tracks": ["*"]
+    }
+  ]
+}
