@@ -1077,11 +1077,11 @@ input:checked+.slider::before{transform:translateX(14px)}
 
     <!-- GEO download panel (shown only for download track) -->
     <div id="geo-panel">
-      <div class="field full" style="max-width:560px">
+      <div class="field full" style="max-width:560px" id="dl-mode-field">
         <label>What to download</label>
         <select id="inp-dl-mode" onchange="updateDownloadMode()">
-          <option value="fastq">Sequencing reads — FASTQ from SRA (genomics &middot; RNA-seq &middot; ATAC/ChIP &middot; WGBS)</option>
-          <option value="matrix">Data matrix — GEO supplementary / URL (proteomics &middot; methylation array)</option>
+          <option value="fastq">Sequencing reads — FASTQ from SRA</option>
+          <option value="matrix">Data matrix — GEO supplementary file or URL</option>
         </select>
       </div>
 
@@ -1173,7 +1173,7 @@ input:checked+.slider::before{transform:translateX(14px)}
           <div class="field" style="max-width:175px">
             <label>Reads / sample</label>
             <input id="inp-geo-reads" type="text" value="1000000">
-            <div class="hint"><code>all</code> = full coverage (use for genomics)</div>
+            <div class="hint" id="geo-reads-hint">subsample size per sample — lower = faster</div>
           </div>
           <button class="btn" onclick="startGeoDownload()">Download selected</button>
           <span id="geo-dl-msg" role="alert" style="font-size:.74rem;color:var(--red)"></span>
@@ -1432,7 +1432,7 @@ function selectTrack(id) {
   document.getElementById("standard-grid").style.display = isDownload ? "none" : "";
   document.getElementById("run-actions").style.display   = isDownload ? "none" : "";
   document.getElementById("geo-panel").style.display     = isDownload ? "block" : "none";
-  if (isDownload && typeof updateDownloadMode === "function") updateDownloadMode();
+  if (isDownload && typeof configureDownloadForProfile === "function") configureDownloadForProfile();
 
   // Reset the standard "Samples CSV" row: proteomics (and methylation-array, set later)
   // don't use a samplesheet. Resetting here also re-shows it when switching back from
@@ -2158,6 +2158,50 @@ function updateDownloadMode() {
   var matrix = document.getElementById("dl-matrix-section");
   if (fastq)  fastq.style.display  = mode === "matrix" ? "none" : "";
   if (matrix) matrix.style.display = mode === "matrix" ? "" : "none";
+}
+
+// Which download kinds a track implies. Deriving from the profile's tracks (rather
+// than a separate config) means a lab gets the right download options the moment its
+// track set includes them — e.g. adding `genomics` to a profile enables the genomics
+// framing automatically, with no extra configuration.
+function _profileDownloadInfo() {
+  var p = _currentProfile ? _profileById(_currentProfile) : null;
+  var tracks = p ? resolveTracks(p).valid : Object.keys(TRACKS);
+  var info = {reads: false, matrix: false, genomics: false};
+  tracks.forEach(function(t) {
+    if (["qc", "rnaseq", "atacseq", "chipseq", "genomics"].indexOf(t) >= 0) info.reads = true;
+    if (t === "methylation") { info.reads = true; info.matrix = true; }   // WGBS reads + array matrix
+    if (t === "proteomics") info.matrix = true;
+    if (t === "genomics") info.genomics = true;
+  });
+  if (!info.reads && !info.matrix) { info.reads = true; info.matrix = true; }
+  return info;
+}
+
+// Tailor the Download Data track to the active profile's data types.
+function configureDownloadForProfile() {
+  var info = _profileDownloadInfo();
+  var sel = document.getElementById("inp-dl-mode");
+  if (sel) {
+    var oF = sel.querySelector('option[value="fastq"]');
+    var oM = sel.querySelector('option[value="matrix"]');
+    if (oF) oF.hidden = !info.reads;
+    if (oM) oM.hidden = !info.matrix;
+    if (!info.reads) sel.value = "matrix";
+    else if (!info.matrix) sel.value = "fastq";
+  }
+  // hide the mode toggle when only one kind applies (nothing to choose)
+  var single = ((info.reads ? 1 : 0) + (info.matrix ? 1 : 0)) <= 1;
+  var modeField = document.getElementById("dl-mode-field");
+  if (modeField) modeField.style.display = single ? "none" : "";
+  // only mention genomics depth for profiles that actually include genomics
+  var hint = document.getElementById("geo-reads-hint");
+  if (hint) {
+    hint.innerHTML = info.genomics
+      ? "subsample size; variant calling needs deeper coverage than this teaching default"
+      : "subsample size per sample — lower = faster";
+  }
+  updateDownloadMode();
 }
 
 async function listSuppl() {
