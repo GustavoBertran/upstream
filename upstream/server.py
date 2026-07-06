@@ -85,6 +85,7 @@ class RunRequest(BaseModel):
     metadata_csv: Optional[str] = None
     # genomics
     reference: Optional[str] = None
+    caller: Optional[str] = None           # bcftools | gatk
     merge: Optional[bool] = None
     min_mapq: Optional[int] = None
     min_baseq: Optional[int] = None
@@ -99,37 +100,30 @@ class RunRequest(BaseModel):
 # ── Routes ────────────────────────────────────────────────────────────────
 
 
-_DEFAULT_PROFILES = {
-    "profiles": [
-        {"id": "aog", "name": "Applied Optimization Group (AOG)",
-         "blurb": "Transcriptomics and the OBAMA pipelines — QC, RNA-seq, ATAC-seq, Methylation, and Download.",
-         "image": "aog.png",
-         "tracks": ["qc", "rnaseq", "atacseq", "methylation", "download"]},
-        {"id": "all", "name": "All pipelines",
-         "blurb": "Every pipeline upstream provides, across all domains.",
-         "tracks": ["*"]},
-    ]
-}
+# Fallback only for a MISSING or malformed profiles.json. Empty on purpose: a fresh
+# install ships with no pre-seeded profiles — users create their own in the web UI
+# (persisted per-browser). A department can pre-seed labs by editing profiles.json.
+_DEFAULT_PROFILES: dict = {"profiles": []}
 
 
 def load_profiles() -> dict:
-    """Load lab-group profiles from upstream/profiles.json (department-editable).
+    """Load seed lab-group profiles from upstream/profiles.json (department-editable).
 
-    Falls back to a built-in default if the file is missing or malformed, so the UI
-    always renders. Unknown track ids in a profile are filtered out client-side with
-    a visible warning. Profiles are navigation only — they do not restrict the CLI.
+    An empty/absent list is valid — it triggers the web UI's first-run "create your
+    first profile" flow. Users' own profiles are created in the browser and stored in
+    localStorage, merged with these seeds at render time. Profiles are navigation only
+    — they never restrict the CLI. Unknown track ids are filtered client-side.
     """
     path = Path(__file__).parent / "profiles.json"
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
-        profs = data.get("profiles")
-        if isinstance(profs, list):
-            cleaned = [p for p in profs
-                       if isinstance(p, dict) and p.get("id") and isinstance(p.get("tracks"), list)]
-            if cleaned:
-                return {"profiles": cleaned}
     except Exception:
-        pass
+        return _DEFAULT_PROFILES          # missing/broken file → built-in (empty) fallback
+    profs = data.get("profiles")
+    if isinstance(profs, list):
+        cleaned = [p for p in profs
+                   if isinstance(p, dict) and p.get("id") and isinstance(p.get("tracks"), list)]
+        return {"profiles": cleaned}       # empty list allowed → first-run create flow
     return _DEFAULT_PROFILES
 
 
@@ -171,7 +165,7 @@ def _preflight_issues(req: "RunRequest") -> list[str]:
         aligner=req.aligner, method=req.method, output_format=req.output_format,
         salmon_index=req.salmon_index, star_index=req.star_index,
         bismark_genome=req.bismark_genome,
-        reference=req.reference, intensities=req.intensities,
+        reference=req.reference, caller=req.caller, intensities=req.intensities,
         betas=req.betas, metadata=req.metadata_csv,
     )
 
@@ -311,6 +305,8 @@ def _build_cmd(req: RunRequest) -> list[str]:
     if req.track == "genomics":
         if req.reference:
             cmd += ["--reference", req.reference]
+        if req.caller:
+            cmd += ["--caller", req.caller]
         if req.merge is False:
             cmd.append("--no-merge")
         if req.min_mapq is not None:
@@ -804,6 +800,31 @@ body.picker-open .sidebar,body.picker-open .main{display:none}
 .profile-card.pc-last{border-color:var(--accent)}
 .pc-last-tag{display:inline-block;margin-left:.5rem;font-size:.62rem;color:var(--accent);
              border:1px solid var(--accent);border-radius:10px;padding:.02rem .42rem;vertical-align:middle}
+/* create/manage profiles */
+.picker-new{margin-top:.9rem;width:100%}
+.pc-wrap{position:relative;display:flex}
+.pc-wrap .profile-card{flex:1}
+.pc-del{position:absolute;top:.5rem;right:.5rem;background:var(--bg);border:1px solid var(--border);
+        border-radius:6px;color:var(--dim);cursor:pointer;font-size:.82rem;line-height:1;
+        padding:.15rem .42rem;z-index:2}
+.pc-del:hover,.pc-del:focus-visible{border-color:var(--red);color:var(--red)}
+.pc-edit{right:2.7rem}
+.pc-edit:hover,.pc-edit:focus-visible{border-color:var(--accent);color:var(--accent)}
+.pf-title{font-size:1.05rem;color:var(--bright);font-weight:600;margin-bottom:1rem}
+.profile-form .field{margin-bottom:.7rem}
+.profile-form label{display:block;font-size:.68rem;text-transform:uppercase;letter-spacing:.06em;
+                    color:var(--dim);margin-bottom:.3rem}
+.profile-form input[type=text]{width:100%;background:var(--bg2);border:1px solid var(--border);
+        border-radius:6px;color:var(--bright);font-size:.85rem;padding:.5rem .65rem;outline:none}
+.profile-form input[type=text]:focus{border-color:var(--accent)}
+.pf-tracks{display:flex;flex-direction:column;gap:.35rem}
+.pf-dom{font-size:.6rem;text-transform:uppercase;letter-spacing:.1em;color:var(--dim);margin-top:.45rem}
+.pf-track{display:flex;align-items:center;gap:.5rem;font-size:.82rem;color:var(--text);
+          cursor:pointer;text-transform:none;letter-spacing:0;margin:0}
+.pf-track input{accent-color:var(--accent);width:14px;height:14px;cursor:pointer}
+.pf-msg{color:var(--red);font-size:.74rem;min-height:1em;margin:.4rem 0 0}
+.pf-actions{display:flex;gap:.6rem;margin-top:1.1rem}
+.picker-empty{color:var(--dim);font-size:.85rem;line-height:1.65;padding:.4rem 0 .2rem}
 .picker-warn{color:var(--yellow);font-size:.72rem;margin-top:1rem}
 /* main */
 .main{flex:1;display:flex;flex-direction:column;padding:1.75rem;gap:1.25rem;
@@ -983,9 +1004,31 @@ input:checked+.slider::before{transform:translateX(14px)}
 <div class="profile-picker" id="profile-picker" role="dialog" aria-modal="true" aria-label="Select your lab group">
   <div class="picker-box">
     <h1 class="picker-title"><span aria-hidden="true">&#9889;</span> upstream</h1>
-    <p class="picker-sub">Select your lab group to see its pipelines.</p>
-    <div id="picker-cards" class="picker-cards"></div>
-    <div id="picker-warn" class="picker-warn" role="alert"></div>
+    <!-- List view: choose or create a profile -->
+    <div id="picker-list">
+      <p class="picker-sub" id="picker-sub">Select your lab group to see its pipelines.</p>
+      <div id="picker-cards" class="picker-cards"></div>
+      <div id="picker-warn" class="picker-warn" role="alert"></div>
+      <button id="picker-new" class="btn ghost picker-new" onclick="showProfileForm()">
+        <span aria-hidden="true">＋</span> New lab profile</button>
+    </div>
+    <!-- Create / edit form -->
+    <div id="profile-form" class="profile-form" style="display:none">
+      <h2 class="pf-title" id="pf-title">New lab profile</h2>
+      <div class="field"><label for="pf-name">Name</label>
+        <input id="pf-name" type="text" placeholder="e.g. Structural Genomics Lab"></div>
+      <div class="field"><label for="pf-blurb">Description (optional)</label>
+        <input id="pf-blurb" type="text" placeholder="what this group works on"></div>
+      <div class="field"><label for="pf-image">Logo URL (optional)</label>
+        <input id="pf-image" type="text" placeholder="https://…/logo.png"></div>
+      <div class="field"><label>Tools this group uses</label>
+        <div id="pf-tracks" class="pf-tracks"></div></div>
+      <div id="pf-msg" class="pf-msg" role="alert"></div>
+      <div class="pf-actions">
+        <button class="btn" onclick="saveProfile()">Save profile</button>
+        <button class="btn ghost" onclick="cancelProfileForm()">Cancel</button>
+      </div>
+    </div>
   </div>
 </div>
 
@@ -1289,10 +1332,26 @@ const EXTRA_INFO = {
 
 let track = null, runId = null, sse = null, stepIdx = 0, _runNsteps = 0;
 
-// ── Lab-group profiles (department-editable, navigation only) ───────────────
+// ── Lab-group profiles (navigation only) ────────────────────────────────────
+// Seed profiles ship in profiles.json (department-editable); users also create
+// their own in the browser (stored in localStorage). The two are merged here.
 const PROFILE_CFG = {{PROFILES}};
-const PROFILES = (PROFILE_CFG && PROFILE_CFG.profiles) || [];
-let _currentProfile = null;
+var SEED_PROFILES = (PROFILE_CFG && PROFILE_CFG.profiles) || [];
+var PROFILES = [];
+var _currentProfile = null;
+var _editingProfileId = null;
+
+function _loadUserProfiles() {
+  try { return JSON.parse(localStorage.getItem("us:userProfiles") || "[]") || []; }
+  catch (e) { return []; }
+}
+function _saveUserProfiles(arr) {
+  try { localStorage.setItem("us:userProfiles", JSON.stringify(arr)); } catch (e) {}
+}
+function _isUserProfile(id) {
+  return _loadUserProfiles().some(function(p) { return p.id === id; });
+}
+function _refreshProfiles() { PROFILES = SEED_PROFILES.concat(_loadUserProfiles()); }
 
 function _profileById(id) {
   for (var i = 0; i < PROFILES.length; i++) if (PROFILES[i].id === id) return PROFILES[i];
@@ -1342,19 +1401,36 @@ function buildSidebar(allowed) {
 }
 
 function showPicker() {
+  _refreshProfiles();
   document.body.classList.add("picker-open");
   document.getElementById("profile-picker").classList.add("open");
+  document.getElementById("profile-form").style.display = "none";  // list view
+  document.getElementById("picker-list").style.display = "";
+  var sub = document.getElementById("picker-sub");
   var warn = document.getElementById("picker-warn"); if (warn) warn.textContent = "";
   var wrap = document.getElementById("picker-cards");
   wrap.innerHTML = "";
   var lastUsed = null;
   try { lastUsed = localStorage.getItem("us:profile"); } catch(e) {}
-  if (!PROFILES.length && warn) warn.textContent = "No profiles configured (upstream/profiles.json).";
+
+  if (!PROFILES.length) {   // first run — nothing configured, nothing created yet
+    if (sub) sub.textContent = "Welcome to upstream.";
+    var empty = document.createElement("div");
+    empty.className = "picker-empty";
+    empty.textContent = "No lab profiles yet. Create one below — name your group and pick "
+      + "the tools it uses — and its pipelines will appear in the sidebar.";
+    wrap.appendChild(empty);
+  } else if (sub) {
+    sub.textContent = "Select your lab group to see its pipelines.";
+  }
+
   PROFILES.forEach(function(p){
     var res = resolveTracks(p);
+    var n = res.valid.length;
+    var holder = document.createElement("div");
+    holder.className = "pc-wrap";
     var card = document.createElement("button");
     card.className = "profile-card"; card.type = "button";
-    var n = res.valid.length;
     card.innerHTML = '<div class="pc-text"><div class="pc-name"></div>'
       + '<div class="pc-blurb"></div>'
       + '<div class="pc-meta">'+n+' track'+(n===1?'':'s')+'</div></div>';
@@ -1362,6 +1438,7 @@ function showPicker() {
     if (src) {  // build via DOM (not innerHTML) so the src can't break out of the attribute
       var img = document.createElement("img");
       img.className = "pc-logo"; img.src = src; img.alt = "";
+      img.onerror = function(){ img.style.display = "none"; };  // bad URL → just hide
       card.insertBefore(img, card.firstChild);
     }
     card.querySelector(".pc-name").textContent = p.name || p.id;
@@ -1382,15 +1459,30 @@ function showPicker() {
           + "(see the browser console).";
       }
     }
-    wrap.appendChild(card);
+    holder.appendChild(card);
+    if (_isUserProfile(p.id)) {   // only user-created profiles are editable/deletable in-UI
+      var edit = document.createElement("button");
+      edit.className = "pc-del pc-edit"; edit.type = "button"; edit.textContent = "✎";
+      edit.setAttribute("aria-label", "Edit " + (p.name || p.id));
+      (function(pid){ edit.onclick = function(e){ e.stopPropagation(); showProfileForm(pid); }; })(p.id);
+      holder.appendChild(edit);
+      var del = document.createElement("button");
+      del.className = "pc-del"; del.type = "button"; del.textContent = "✕";
+      del.setAttribute("aria-label", "Delete " + (p.name || p.id));
+      (function(pid){ del.onclick = function(e){ deleteProfile(pid, e); }; })(p.id);
+      holder.appendChild(del);
+    }
+    wrap.appendChild(holder);
   });
   // focus the last-used lab if present, else the first selectable card
   var focusCard = wrap.querySelector(".profile-card.pc-last")
-               || wrap.querySelector(".profile-card:not([disabled])");
+               || wrap.querySelector(".profile-card:not([disabled])")
+               || document.getElementById("picker-new");
   if (focusCard) focusCard.focus();
 }
 
 function enterProfile(id) {
+  _refreshProfiles();
   var p = _profileById(id);
   if (!p) { showPicker(); return; }
   var res = resolveTracks(p);
@@ -1411,6 +1503,92 @@ function enterProfile(id) {
 }
 
 function switchLab() { showPicker(); }
+
+// ── Create / edit / delete user profiles (stored in localStorage) ───────────
+
+function _slug(s) {
+  return (s || "").toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "") || "lab";
+}
+function _uniqueProfileId(base, keepId) {
+  _refreshProfiles();
+  var taken = {};
+  PROFILES.forEach(function(p){ if (p.id !== keepId) taken[p.id] = 1; });
+  var cand = base, n = 1;
+  while (taken[cand]) cand = base + "-" + (++n);
+  return cand;
+}
+
+// Build the domain-grouped track checklist inside the create/edit form.
+function _buildTrackChecklist(selected) {
+  var host = document.getElementById("pf-tracks");
+  host.innerHTML = "";
+  var sel = {}; (selected || []).forEach(function(id){ sel[id] = 1; });
+  for (var di = 0; di < DOMAINS.length; di++) {
+    var dom = DOMAINS[di];
+    var entries = Object.keys(TRACKS).filter(function(id){ return TRACKS[id].group === dom; });
+    if (!entries.length) continue;
+    var h = document.createElement("div"); h.className = "pf-dom"; h.textContent = dom;
+    host.appendChild(h);
+    entries.forEach(function(id){
+      var lab = document.createElement("label"); lab.className = "pf-track";
+      var cb = document.createElement("input");
+      cb.type = "checkbox"; cb.value = id; cb.checked = !!sel[id];
+      lab.appendChild(cb);
+      lab.appendChild(document.createTextNode(" " + TRACKS[id].label));
+      host.appendChild(lab);
+    });
+  }
+}
+
+function showProfileForm(editId) {
+  _refreshProfiles();
+  _editingProfileId = editId || null;
+  var editing = editId ? _profileById(editId) : null;
+  document.getElementById("pf-title").textContent = editing ? "Edit lab profile" : "New lab profile";
+  document.getElementById("pf-name").value  = editing ? (editing.name || "") : "";
+  document.getElementById("pf-blurb").value = editing ? (editing.blurb || "") : "";
+  document.getElementById("pf-image").value = editing ? (editing.image || "") : "";
+  document.getElementById("pf-msg").textContent = "";
+  _buildTrackChecklist(editing ? resolveTracks(editing).valid : []);
+  document.getElementById("picker-list").style.display = "none";
+  document.getElementById("profile-form").style.display = "";
+  document.getElementById("pf-name").focus();
+}
+
+function cancelProfileForm() { showPicker(); }
+
+function saveProfile() {
+  var name = document.getElementById("pf-name").value.trim();
+  var blurb = document.getElementById("pf-blurb").value.trim();
+  var image = document.getElementById("pf-image").value.trim();
+  var tracks = Array.prototype.slice
+    .call(document.querySelectorAll("#pf-tracks input[type=checkbox]:checked"))
+    .map(function(cb){ return cb.value; });
+  var msg = document.getElementById("pf-msg");
+  if (!name)          { msg.textContent = "Give the profile a name."; return; }
+  if (!tracks.length) { msg.textContent = "Pick at least one tool."; return; }
+
+  var id = _editingProfileId || _uniqueProfileId(_slug(name));
+  var profile = {id: id, name: name, tracks: tracks, _user: true};
+  if (blurb) profile.blurb = blurb;
+  if (image) profile.image = image;
+
+  var users = _loadUserProfiles();
+  var idx = users.findIndex(function(p){ return p.id === id; });
+  if (idx >= 0) users[idx] = profile; else users.push(profile);
+  _saveUserProfiles(users);
+  _editingProfileId = null;
+  showPicker();
+}
+
+function deleteProfile(id, ev) {
+  if (ev) ev.stopPropagation();
+  var p = _profileById(id);
+  if (!confirm("Delete the profile: " + ((p && p.name) || id)
+      + " ?  This only removes it from this browser.")) return;
+  _saveUserProfiles(_loadUserProfiles().filter(function(x){ return x.id !== id; }));
+  showPicker();
+}
 
 function selectTrack(id) {
   if (runId) return;
@@ -1538,6 +1716,19 @@ function selectTrack(id) {
                '<button class="browse-btn" data-inp="inp-'+k+'" data-btype="'+(i.btype||"dir")+'">...</button>' +
                '</div></div>';
       }).join("");
+      if (id === "genomics") {
+        ef.innerHTML +=
+          '<div class="field full">' +
+            '<label>Variant caller</label>' +
+            '<select id="inp-caller">' +
+              '<option value="bcftools">bcftools — mpileup | call (lightweight)</option>' +
+              '<option value="gatk">GATK HaplotypeCaller (field standard; needs a .dict)</option>' +
+            '</select>' +
+            '<div class="hint">GATK re-assembles each region — better around indels. ' +
+              'It needs a <code>.dict</code> next to the reference ' +
+              '(<code>samtools dict ref.fa -o ref.dict</code>).</div>' +
+          '</div>';
+      }
       if (id === "atacseq") {
         ef.innerHTML +=
           '<div class="field full">' +
@@ -2338,6 +2529,9 @@ async function startRun() {
       const v  = el ? el.value.trim() : "";
       if (!v) { err(EXTRA_INFO[k].label+" is required."); return; }
       body[k.split("-").join("_")] = v;
+    }
+    if (track === "genomics") {
+      body.caller = (document.getElementById("inp-caller") || {value:"bcftools"}).value;
     }
     if (track === "atacseq") {
       body.output_format = (document.getElementById("inp-format") || {value:"obama"}).value;

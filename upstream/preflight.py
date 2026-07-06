@@ -17,6 +17,7 @@ def required_tools(
     aligner: Optional[str] = None,
     method: Optional[str] = None,
     output_format: Optional[str] = None,
+    caller: Optional[str] = None,
 ) -> list[str]:
     """External tools that must be on PATH to run *track* with the given options."""
     if track == "qc":
@@ -24,7 +25,10 @@ def required_tools(
     if track == "rnaseq":
         return ["fastp", "STAR" if aligner == "star" else "salmon"]
     if track == "genomics":
-        return ["fastp", "bwa", "samtools", "bcftools"]
+        tools = ["fastp", "bwa", "samtools", "bcftools"]
+        if caller == "gatk":
+            tools.append("gatk")
+        return tools
     if track == "proteomics":
         return []  # pure-Python intensity-matrix analysis
     if track in ("atacseq", "chipseq"):
@@ -135,6 +139,7 @@ def run_issues(
     metadata: Optional[str] = None,
     reference: Optional[str] = None,
     intensities: Optional[str] = None,
+    caller: Optional[str] = None,
 ) -> list[str]:
     """All problems that would block a run of *track* — the shared preflight used by
     both `upstream check` and the web UI's pre-run gate. Empty list = ready to run."""
@@ -152,7 +157,8 @@ def run_issues(
             issues.append("samplesheet: not provided")
 
     for tool in missing_tools(
-        required_tools(track, aligner=aligner, method=method, output_format=output_format)
+        required_tools(track, aligner=aligner, method=method,
+                       output_format=output_format, caller=caller)
     ):
         issues.append(f"tool: '{tool}' not found on PATH (activate the environment?)")
 
@@ -181,6 +187,10 @@ def run_issues(
                 if not Path(str(ref) + ".fai").exists():
                     issues.append(f"reference: samtools faidx index missing ({ref.name}.fai) — "
                                   f"run samtools faidx {ref}")
+                if caller == "gatk" and not ref.with_suffix(".dict").exists():
+                    issues.append(f"reference: GATK sequence dictionary missing "
+                                  f"({ref.with_suffix('.dict').name}) — run "
+                                  f"samtools dict {ref} -o {ref.with_suffix('.dict')}")
         else:
             issues.append("reference: not provided")
 

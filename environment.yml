@@ -22,6 +22,7 @@ dependencies:
   # Genomics (germline variant calling)
   - bwa=0.7.18
   - bcftools=1.21   # matches samtools 1.21 (shared htslib)
+  - gatk4=4.5.0.0   # GATK HaplotypeCaller (--caller gatk)
   # Shared utilities
   - sra-tools=3.1   # prefetch + fasterq-dump (GEO/SRA download)
   - seqtk=1.4

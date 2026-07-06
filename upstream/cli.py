@@ -206,11 +206,12 @@ def _require_index(path: Optional[Path], tool: str, label: str) -> None:
         raise typer.Exit(1)
 
 
-def _require_bwa_index(reference: Optional[Path]) -> None:
+def _require_bwa_index(reference: Optional[Path], need_dict: bool = False) -> None:
     """Require a reference FASTA with its bwa (.bwt) and samtools faidx (.fai) sidecars.
 
     A bare FASTA without these would pass an existence check then fail mid-run, so we
-    validate the companions up front and point at index-help.
+    validate the companions up front and point at index-help. With need_dict (GATK), a
+    sequence dictionary (.dict) is required too.
     """
     hint = ("[dim]Build it:[/dim] "
             "[bold]upstream index-help --tool bwa --genome <human|mouse>[/bold]")
@@ -227,6 +228,11 @@ def _require_bwa_index(reference: Optional[Path]) -> None:
     if not Path(str(ref) + ".fai").exists():
         console.print(f"[bold red]Error:[/bold red] FASTA index missing for {ref.name} "
                       f"(expected {ref.name}.fai). Run: [bold]samtools faidx {ref}[/bold]")
+        raise typer.Exit(1)
+    if need_dict and not ref.with_suffix(".dict").exists():
+        console.print(f"[bold red]Error:[/bold red] GATK sequence dictionary missing "
+                      f"(expected {ref.with_suffix('.dict').name}). Run: "
+                      f"[bold]samtools dict {ref} -o {ref.with_suffix('.dict')}[/bold]")
         raise typer.Exit(1)
 
 
@@ -391,36 +397,45 @@ def genomics(
              ".fai must sit alongside it — see index-help --tool bwa.",
     )],
     outdir: OutdirOpt,
+    caller: Annotated[str, typer.Option(
+        "--caller",
+        help="Variant caller: 'bcftools' (default, lightweight) or 'gatk' "
+             "(GATK HaplotypeCaller — the field standard; needs a .dict).",
+    )] = "bcftools",
     merge: Annotated[bool, typer.Option(
         "--merge/--no-merge",
         help="After per-sample calling, merge per-sample VCFs into cohort.vcf.gz "
              "(bcftools merge). Auto-skipped with a single sample.",
     )] = True,
     min_mapq: Annotated[int, typer.Option(
-        "--min-mapq", help="Minimum read mapping quality for mpileup (-q).")] = 20,
+        "--min-mapq", help="Minimum read mapping quality (bcftools mpileup -q).")] = 20,
     min_baseq: Annotated[int, typer.Option(
-        "--min-baseq", help="Minimum base quality for mpileup (-Q).")] = 20,
+        "--min-baseq", help="Minimum base quality (bcftools mpileup -Q).")] = 20,
     threads: ThreadsOpt = 4,
     explain: ExplainOpt = True,
     dry_run: DryRunOpt = False,
 ) -> None:
-    """Genomics: trim (fastp) → align (BWA-MEM) → mark duplicates → call variants (bcftools).
+    """Genomics: trim (fastp) → align (BWA-MEM) → mark duplicates → call variants.
 
     Germline short-variant calling. Each sample is aligned with BWA-MEM, duplicates
-    are marked, and SNVs/indels are called per sample with bcftools mpileup|call;
-    with --merge (default) the per-sample VCFs are combined into cohort.vcf.gz.
-    Output is VCF + variant_summary.csv — no matrix, no OBAMA. For production, use the
-    GATK Best Practices pipeline (HaplotypeCaller → GenotypeGVCFs).
+    are marked, and SNVs/indels are called per sample — with bcftools mpileup|call
+    (default) or GATK HaplotypeCaller (--caller gatk, the field standard). With
+    --merge (default) the per-sample VCFs are combined into cohort.vcf.gz. Output is
+    VCF + variant_summary.csv — no matrix, no OBAMA. Joint genotyping (GATK GVCF →
+    GenotypeGVCFs) is the further production step, described in the step explanations.
     """
+    if caller not in ("bcftools", "gatk"):
+        _die("--caller must be 'bcftools' or 'gatk'.")
     sample_list = _read_samplesheet(samples)
-    _require_tools("genomics", dry=dry_run)
+    _require_tools("genomics", dry=dry_run, caller=caller)
     if not dry_run:
-        _require_bwa_index(reference)
+        _require_bwa_index(reference, need_dict=(caller == "gatk"))
     runner.DRY_RUN = dry_run
     outdir.mkdir(parents=True, exist_ok=True)
 
     TOTAL = 5
-    console.print(f"\n[bold]Genomics pipeline[/bold] — {len(sample_list)} sample(s) → {outdir}\n")
+    console.print(f"\n[bold]Genomics pipeline[/bold] ({caller}) — "
+                  f"{len(sample_list)} sample(s) → {outdir}\n")
 
     results: list[tuple[str, str, Path, Path]] = []   # (name, group, vcf, stats)
 
@@ -490,22 +505,38 @@ def genomics(
                 _die(f"markdup chain failed at: {' '.join(str(c) for c in cmd[:2])}")
         _check(*checkpoints.check_markdup_bam(markdup_bam))
 
-        # 4 — Call variants (bcftools mpileup | call), bgzipped per sample
-        runner.step_header("Call variants — bcftools", 4, TOTAL)
+        # 4 — Call variants (bcftools mpileup|call, or GATK HaplotypeCaller), bgzipped per sample
+        runner.step_header(
+            f"Call variants — {'GATK HaplotypeCaller' if caller == 'gatk' else 'bcftools'}",
+            4, TOTAL,
+        )
         if explain:
             _explain("genomics_call.md")
         var_dir = sdir / "variants"
         var_dir.mkdir(exist_ok=True)
         vcf = var_dir / f"{name}.vcf.gz"
-        rc = runner.pipe(
-            ["bcftools", "mpileup", "-f", str(reference),
-             "-q", str(min_mapq), "-Q", str(min_baseq),
-             "-a", "FORMAT/AD,FORMAT/DP", "-Ou", str(markdup_bam)],
-            ["bcftools", "call", "-mv", "-Oz", "-o", str(vcf)],
-        )
-        if rc != 0:
-            _die(f"bcftools mpileup/call failed for sample '{name}'.")
-        runner.run(["bcftools", "index", "-t", str(vcf)])  # tabix index (merge needs it)
+        if caller == "gatk":
+            # HaplotypeCaller: local reassembly caller; needs the ref .fai + .dict, a
+            # coord-sorted, duplicate-marked, indexed BAM with read groups (all present).
+            rc = runner.run([
+                "gatk", "HaplotypeCaller",
+                "-R", str(reference),
+                "-I", str(markdup_bam),
+                "-O", str(vcf),
+            ])
+            if rc != 0:
+                _die(f"GATK HaplotypeCaller failed for sample '{name}'.")
+            runner.run(["bcftools", "index", "-f", "-t", str(vcf)])  # ensure a tabix index for merge
+        else:
+            rc = runner.pipe(
+                ["bcftools", "mpileup", "-f", str(reference),
+                 "-q", str(min_mapq), "-Q", str(min_baseq),
+                 "-a", "FORMAT/AD,FORMAT/DP", "-Ou", str(markdup_bam)],
+                ["bcftools", "call", "-mv", "-Oz", "-o", str(vcf)],
+            )
+            if rc != 0:
+                _die(f"bcftools mpileup/call failed for sample '{name}'.")
+            runner.run(["bcftools", "index", "-t", str(vcf)])  # tabix index (merge needs it)
         _check(*checkpoints.check_vcf(vcf))
         stats = var_dir / f"{name}.stats.txt"
         runner.run_capture(["bcftools", "stats", str(vcf)], stats)
@@ -544,7 +575,8 @@ def genomics(
     if mqc:
         written = list(written) + [mqc]
     _write_run_summary(outdir, "genomics", written, None,
-                       {"samples": str(samples), "reference": str(reference), "merge": str(merge)})
+                       {"samples": str(samples), "reference": str(reference),
+                        "caller": caller, "merge": str(merge)})
     console.print(f"\n[bold green]Done.[/bold green] Wrote: {', '.join(p.name for p in written)} → {outdir}")
 
 
@@ -1444,6 +1476,7 @@ def check(
     bowtie2_index: Annotated[Optional[Path], typer.Option("--bowtie2-index")] = None,
     bismark_genome: Annotated[Optional[Path], typer.Option("--bismark-genome")] = None,
     reference: Annotated[Optional[Path], typer.Option("--reference", help="genomics reference FASTA.")] = None,
+    caller: Annotated[str, typer.Option("--caller", help="genomics variant caller (bcftools/gatk).")] = "bcftools",
     intensities: Annotated[Optional[Path], typer.Option("--intensities", help="proteomics intensity table.")] = None,
     betas: Annotated[Optional[Path], typer.Option("--betas")] = None,
     metadata: Annotated[Optional[Path], typer.Option("--metadata")] = None,
@@ -1462,6 +1495,7 @@ def check(
         star_index=str(star_index) if star_index else None,
         bismark_genome=str(bismark_genome) if bismark_genome else None,
         reference=str(reference) if reference else None,
+        caller=caller,
         intensities=str(intensities) if intensities else None,
         betas=str(betas) if betas else None,
         metadata=str(metadata) if metadata else None,

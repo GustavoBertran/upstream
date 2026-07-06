@@ -1,5 +1,5 @@
 {
-  "_comment": "Lab-group profiles for the Biology Department. Each profile scopes the web UI sidebar to the tracks that group uses. To add a lab: copy a block, give it a unique id, a name/blurb, and list its track ids. Optional 'image' = a logo: a filename placed in upstream/static/ (png/jpg/svg) or a full https URL. Valid track ids: qc, genomics, rnaseq, atacseq, chipseq, methylation, proteomics, download. Use [\"*\"] for every track. This is navigation only — it does not restrict the CLI or lock anyone out.",
+  "_comment": "SEED lab-group profiles that ship with this install. Users can also create their own profiles in the web UI (＋ New lab profile), stored per-browser. Leave 'profiles' empty ([]) to ship blank — the UI then greets first-run users with a 'create your first profile' screen. Each seed profile scopes the sidebar to the tracks that group uses: give it a unique id, a name/blurb, and list its track ids. Optional 'image' = a logo (a filename in upstream/static/, or a full https URL). Valid track ids: qc, genomics, rnaseq, atacseq, chipseq, methylation, proteomics, download. Use [\"*\"] for every track. Navigation only — it never restricts the CLI.",
   "profiles": [
     {
       "id": "aog",

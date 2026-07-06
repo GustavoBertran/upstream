@@ -71,12 +71,14 @@ def recommend(tool: str, genome: str = "human") -> str:
             f"# then:  upstream methylation --method wgbs --bismark-genome ./bismark_genome ..."
         )
     if tool == "bwa":
+        dict_name = fa.rsplit(".", 1)[0] + ".dict"
         return (
             f"# BWA index + FASTA index — {g['label']}  (a few GB RAM)\n"
             f"curl -O {base}/{fa_gz}\n"
             f"gzip -d {fa_gz}\n"
             f"bwa index {fa}\n"
             f"samtools faidx {fa}            # bcftools mpileup -f needs the .fai\n"
+            f"samtools dict {fa} -o {dict_name}   # only for --caller gatk (HaplotypeCaller)\n"
             f"# then:  upstream genomics --reference ./{fa} --samples samples.csv --outdir results/"
         )
     raise ValueError(f"unknown tool: {tool}")

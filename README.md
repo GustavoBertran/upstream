@@ -3,8 +3,8 @@
 `upstream` is a command-line bioinformatics pipeline for high-throughput sequencing (HTS) data,
 organized by domain — **Genomics** (variant calling), **Transcriptomics** (RNA-seq),
 **Epigenomics** (ATAC-seq, ChIP-seq, methylation), and **Proteomics** (intensity-matrix
-analysis), plus quality control. It wraps standard tools (FastQC, fastp, BWA, bcftools, STAR,
-Salmon, Bowtie2, MACS2, Bismark) behind one consistent command per analysis type. The
+analysis), plus quality control. It wraps standard tools (FastQC, fastp, BWA, bcftools, GATK,
+STAR, Salmon, Bowtie2, MACS2, Bismark) behind one consistent command per analysis type. The
 transcriptomics track produces matrices compatible with the
 [OBAMA pipeline](https://github.com/AOG-Lab/OBAMA); the other tracks emit the standard outputs
 for their field (VCF for genomics; DESeq2/edgeR/limma count matrices elsewhere).
@@ -49,7 +49,12 @@ upstream serve
 
 Then open **http://localhost:8421** in your browser.
 
-The interface lets you:
+**Lab-group profiles.** On launch the UI asks you to pick a **lab-group profile**, which scopes the
+sidebar to just the pipelines that group uses. A fresh install ships with none — click **＋ New lab
+profile**, name your group, and tick the tools it uses; your profiles are saved in the browser and
+can be edited or deleted. A department can also pre-seed profiles in `upstream/profiles.json` (this
+build ships the AOG profile as an example). Profiles are navigation only — they never restrict the
+CLI. The rest of the interface lets you:
 - **Browse** your filesystem to fill in file/folder paths (click the `...` button next to any input)
 - **Select a track** in the sidebar, grouped by domain (Genomics, Transcriptomics, Epigenomics,
   Proteomics, plus QC and Download Data)
@@ -104,13 +109,23 @@ upstream genomics \
 ```
 
 Each sample is trimmed (fastp), aligned (BWA-MEM), duplicate-marked (samtools), and called
-with `bcftools mpileup | call`, producing a per-sample `variants/<name>.vcf.gz`. With `--merge`
-(default) the per-sample VCFs are combined into `cohort.vcf.gz`; a `variant_summary.csv` reports
-SNP/indel counts and ts/tv per sample. **No OBAMA matrix** — variant calling's natural output is a
-VCF. The reference FASTA needs its BWA index (`.bwt` …) and `.fai` alongside it — run
-`upstream index-help --tool bwa --genome human` for the build commands. For production work the
-GATK Best Practices pipeline (HaplotypeCaller/GenotypeGVCFs) is the gold standard; this track uses
-bcftools as a lighter, teachable equivalent.
+per sample, producing a `variants/<name>.vcf.gz`. With `--merge` (default) the per-sample VCFs are
+combined into `cohort.vcf.gz`; a `variant_summary.csv` reports SNP/indel counts and ts/tv per
+sample. **No OBAMA matrix** — variant calling's natural output is a VCF.
+
+Choose the caller with `--caller`:
+- `bcftools` (default) — `bcftools mpileup | call`; lightweight, few dependencies.
+- `gatk` — **GATK HaplotypeCaller**, the field-standard germline caller (local re-assembly, better
+  around indels). It additionally needs a sequence dictionary (`.dict`) beside the reference.
+
+```bash
+upstream genomics --samples samples.csv --reference /path/to/hg38.fa \
+  --caller gatk --outdir results/genomics/
+```
+
+The reference FASTA needs its BWA index (`.bwt` …) and `.fai` (and a `.dict` for `--caller gatk`)
+alongside it — run `upstream index-help --tool bwa --genome human` for the exact build commands.
+Full joint genotyping (GATK GVCF → GenotypeGVCFs) is the remaining production step.
 
 **RNA-seq (Salmon, alignment-free — default):**
 ```bash

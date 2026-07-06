@@ -77,6 +77,25 @@ def test_genomics_missing_index(tmp, monkeypatch):
     assert "index-help --tool bwa" in res.output
 
 
+def test_genomics_gatk_dry_run(tmp):
+    sheet = _samplesheet(tmp, paired=True)
+    ref = _reference(tmp)
+    res = runner.invoke(app, ["genomics", "--samples", str(sheet), "--reference", str(ref),
+                              "--outdir", str(tmp / "out"), "--caller", "gatk",
+                              "--dry-run", "--no-explain"])
+    assert res.exit_code == 0, res.output
+    assert "gatk" in res.output and "HaplotypeCaller" in res.output
+    assert "mpileup" not in res.output   # gatk path replaces bcftools calling
+
+
+def test_genomics_bad_caller(tmp):
+    sheet = _samplesheet(tmp, paired=True)
+    ref = _reference(tmp)
+    res = runner.invoke(app, ["genomics", "--samples", str(sheet), "--reference", str(ref),
+                              "--outdir", str(tmp / "out"), "--caller", "bogus", "--no-explain"])
+    assert res.exit_code == 1
+
+
 # ── proteomics ──────────────────────────────────────────────────────────────
 
 

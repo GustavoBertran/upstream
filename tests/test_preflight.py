@@ -12,7 +12,21 @@ def tmp(tmp_path):
 
 def test_required_tools_new_tracks():
     assert preflight.required_tools("genomics") == ["fastp", "bwa", "samtools", "bcftools"]
+    assert preflight.required_tools("genomics", caller="gatk") == \
+        ["fastp", "bwa", "samtools", "bcftools", "gatk"]
     assert preflight.required_tools("proteomics") == []
+
+
+def test_genomics_gatk_requires_dict(tmp):
+    fa = tmp / "genome.fa"
+    fa.write_text(">chr1\nACGT\n")
+    (tmp / "genome.fa.bwt").write_bytes(b"x")
+    (tmp / "genome.fa.fai").write_text("chr1\t4\t6\t4\t5\n")   # bwa + faidx present, no .dict
+    issues = preflight.run_issues("genomics", reference=str(fa), caller="gatk")
+    assert any(".dict" in i for i in issues)
+    # bcftools caller must NOT demand a .dict
+    assert not any(".dict" in i for i in preflight.run_issues("genomics", reference=str(fa),
+                                                              caller="bcftools"))
 
 
 def test_genomics_missing_samples_and_reference():
